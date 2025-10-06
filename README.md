@@ -29,6 +29,8 @@ go build -o havoc
 ./havoc headless --host 127.0.0.1 --port 40056 --user operator
 ```
 
+> **Note:** Run Go commands from the `teamserver` directory. Executing `go build` from the repository root will produce the `go: cannot find main module` error because the module definition lives under `teamserver/`.
+
 Provide the operator password with `--password <value>` or set `HAVOC_PASSWORD` in the environment before launching the command. Use `--no-prompt` when you only want to stream log messages without the interactive shell.
 
 Inside the prompt, type `help` to see every available command. Typical examples are:
@@ -36,7 +38,7 @@ Inside the prompt, type `help` to see every available command. Typical examples 
 * `listeners` – show the listeners the teamserver currently exposes.
 * `agents` – list active implants and their status.
 * `chat <message>` – broadcast a message to all connected operators.
-* `task <agent-id> <command-id> CommandLine whoami` – send an operator task to an agent (command identifiers are defined in [`teamserver/pkg/agent/commands.go`](teamserver/pkg/agent/commands.go)).
+* `task <agent-id> 12 FromProcessManager=false` – queue the built-in process list command (command identifiers are defined in [`teamserver/pkg/agent/commands.go`](teamserver/pkg/agent/commands.go)).
 * `mark <agent-id> Dead` – flag an agent session without closing the connection.
 
 Consult [`docs/headless-go-client.md`](docs/headless-go-client.md) for a deeper dive into extending or automating the headless client.

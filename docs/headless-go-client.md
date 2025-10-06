@@ -12,6 +12,8 @@ go build -o havoc
 ./havoc headless --host 127.0.0.1 --port 40056 --user operator --password "super-secret"
 ```
 
+> **Tip:** Always run Go tooling from inside the `teamserver/` module. Invocations from the repository root will error with `go: cannot find main module` because the Go sources live beneath `teamserver/`.
+
 Authentication also honours the `HAVOC_PASSWORD` environment variable, so you can omit `--password` and export the secret instead. The `--insecure=false` flag enables strict TLS verification, and `--no-prompt` starts the client in log-only mode without the interactive REPL. 【F:teamserver/cmd/headless/headless.go†L39-L118】
 
 After a successful login you will land in a prompt that mirrors core GUI actions:
@@ -25,8 +27,10 @@ redirector      https      0.0.0.0     443    teamserver   RUNNING  2024-04-03T1
 ID        USER@HOST        INTERNAL        EXTERNAL        PROCESS      PID   ARCH   SLEEP   STATUS
 AGT0213   user@workstn     10.0.4.23       203.0.113.42    explorer.exe 1044  x64    30s     Alive
 > chat Testing headless client
-> task AGT0213 12 CommandLine whoami
+> task AGT0213 12 FromProcessManager=false
 queued command 12 for agent AGT0213 (task 5b8f3a60)
+> task AGT0213 0x1010 shell whoami ProcCommand=4 Args=0;FALSE;TRUE;c:\\windows\\system32\\cmd.exe;L2Mgd2hvYW1p
+queued command 0x1010 for agent AGT0213 (task 3a21d91c)
 > task AGT0213 2510 one-time
 queued command 2510 for agent AGT0213 (task 181c0e24)
 > mark AGT0213 Dead
@@ -34,10 +38,18 @@ queued command 2510 for agent AGT0213 (task 181c0e24)
 
 * `listeners`, `agents`, and `chatlog` render cached state the reader thread maintains for you. 【F:teamserver/cmd/headless/headless.go†L421-L481】
 * `chat <message>` broadcasts a base64-encoded message to every operator session. 【F:teamserver/cmd/headless/headless.go†L489-L512】
-* `task <agent-id> <command-id> ...` submits work to the selected agent. Tokens without an equals sign become the `CommandLine` string while `key=value` pairs populate explicit fields in the package payload. Add the literal `one-time` token when you want the teamserver to treat the task as transient output. 【F:teamserver/cmd/headless/headless.go†L514-L569】
+* `task <agent-id> <command-id> ...` submits work to the selected agent. Tokens without an equals sign become the `CommandLine` string while `key=value` pairs populate explicit fields in the package payload. Add the literal `one-time` token when you want the teamserver to treat the task as transient output. The client automatically supplies the `FromProcessManager=false` flag that the GUI always includes with process listings, so you only need to override it when queueing tasks from the process manager UI. 【F:teamserver/cmd/headless/headless.go†L514-L615】
 * `mark <agent-id> <Alive|Dead>` updates the agent’s status flag in Havoc. 【F:teamserver/cmd/headless/headless.go†L571-L603】
 
 Command identifiers line up with the constants in [`teamserver/pkg/agent/commands.go`](../teamserver/pkg/agent/commands.go). For example, `12` invokes `COMMAND_PROC_LIST` while `2510` triggers `COMMAND_SCREENSHOT`. Combine those values with sub-command key/value pairs (e.g. `SubCommand=1`) to reach deeper capabilities.
+
+When replicating higher-level console actions (such as `shell`), translate the Qt client’s payloads before sending them. The GUI wraps shell execution inside the process module, so you need to send both the numeric process command and the encoded arguments:
+
+```text
+> task AGT0213 0x1010 shell whoami ProcCommand=4 Args=0;FALSE;TRUE;c:\\windows\\system32\\cmd.exe;L2Mgd2hvYW1p
+```
+
+That format mirrors `CommandExecute::ProcModule` inside the Qt source. `ProcCommand=4` selects the “create process” branch and the trailing base64 value (`L2Mgd2hvYW1p`) is the encoded `/c whoami` argument block that the demon expects. Use the other helpers in `client/src/Havoc/Demon/CommandSend.cc` as a reference when you script additional task types. 【F:client/src/Havoc/Demon/ConsoleInput.cc†L856-L877】【F:client/src/Havoc/Demon/CommandSend.cc†L284-L315】
 
 ## 1. Understand the Transport
 

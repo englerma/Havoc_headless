@@ -25,6 +25,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/sha3"
 
+	"Havoc/pkg/agent"
 	"Havoc/pkg/packager"
 )
 
@@ -586,8 +587,12 @@ func (c *headlessClient) handleTaskCommand(line string, args []string) error {
 		}
 	}
 
-	if _, ok := info["CommandLine"]; !ok && len(commandLineParts) > 0 {
+	if _, ok := info["CommandLine"]; !ok {
 		info["CommandLine"] = strings.Join(commandLineParts, " ")
+	}
+
+	if parsedID, err := strconv.ParseInt(commandID, 0, 64); err == nil {
+		c.applyCommandDefaults(info, int(parsedID))
 	}
 
 	pk := packager.Package{
@@ -612,6 +617,15 @@ func (c *headlessClient) handleTaskCommand(line string, args []string) error {
 
 	c.printf("queued command %s for agent %s (task %s)", commandID, agentID, info["TaskID"])
 	return nil
+}
+
+func (c *headlessClient) applyCommandDefaults(info map[string]any, commandID int) {
+	switch commandID {
+	case agent.COMMAND_PROC_LIST:
+		if _, ok := info["FromProcessManager"]; !ok {
+			info["FromProcessManager"] = "false"
+		}
+	}
 }
 
 func (c *headlessClient) markAgent(agentID, mark string) error {
