@@ -2,6 +2,43 @@
 
 This guide explains how to replace the Qt-based GUI client with a custom headless client written in Go. It summarises the network protocol used between the existing client and the Havoc teamserver and outlines a reference architecture for interacting with the teamserver programmatically.
 
+## Using the bundled headless client
+
+The repository now includes a ready-to-run CLI client under the `headless` subcommand of the teamserver binary. Build the Go project and connect to a running teamserver instance:
+
+```bash
+cd teamserver
+go build -o havoc
+./havoc headless --host 127.0.0.1 --port 40056 --user operator --password "super-secret"
+```
+
+Authentication also honours the `HAVOC_PASSWORD` environment variable, so you can omit `--password` and export the secret instead. The `--insecure=false` flag enables strict TLS verification, and `--no-prompt` starts the client in log-only mode without the interactive REPL. 【F:teamserver/cmd/headless/headless.go†L39-L118】
+
+After a successful login you will land in a prompt that mirrors core GUI actions:
+
+```text
+Headless Havoc client ready. Type 'help' for a list of commands.
+> listeners
+NAME            PROTOCOL   BIND        PORT   HOSTS        STATUS   UPDATED
+redirector      https      0.0.0.0     443    teamserver   RUNNING  2024-04-03T12:17:03Z
+> agents
+ID        USER@HOST        INTERNAL        EXTERNAL        PROCESS      PID   ARCH   SLEEP   STATUS
+AGT0213   user@workstn     10.0.4.23       203.0.113.42    explorer.exe 1044  x64    30s     Alive
+> chat Testing headless client
+> task AGT0213 12 CommandLine whoami
+queued command 12 for agent AGT0213 (task 5b8f3a60)
+> task AGT0213 2510 one-time
+queued command 2510 for agent AGT0213 (task 181c0e24)
+> mark AGT0213 Dead
+```
+
+* `listeners`, `agents`, and `chatlog` render cached state the reader thread maintains for you. 【F:teamserver/cmd/headless/headless.go†L421-L481】
+* `chat <message>` broadcasts a base64-encoded message to every operator session. 【F:teamserver/cmd/headless/headless.go†L489-L512】
+* `task <agent-id> <command-id> ...` submits work to the selected agent. Tokens without an equals sign become the `CommandLine` string while `key=value` pairs populate explicit fields in the package payload. Add the literal `one-time` token when you want the teamserver to treat the task as transient output. 【F:teamserver/cmd/headless/headless.go†L514-L569】
+* `mark <agent-id> <Alive|Dead>` updates the agent’s status flag in Havoc. 【F:teamserver/cmd/headless/headless.go†L571-L603】
+
+Command identifiers line up with the constants in [`teamserver/pkg/agent/commands.go`](../teamserver/pkg/agent/commands.go). For example, `12` invokes `COMMAND_PROC_LIST` while `2510` triggers `COMMAND_SCREENSHOT`. Combine those values with sub-command key/value pairs (e.g. `SubCommand=1`) to reach deeper capabilities.
+
 ## 1. Understand the Transport
 
 * The Qt client connects to the teamserver over a WebSocket endpoint at `wss://<host>:<port>/havoc/` and ignores TLS validation errors. The same URI and TLS behaviour must be reproduced by the headless client. 【F:client/src/Havoc/Connector.cc†L10-L44】

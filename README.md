@@ -19,6 +19,28 @@ Havoc works well on Debian 10/11, Ubuntu 20.04/22.04 and Kali Linux. It's recomm
 
 See the [Installation](https://havocframework.com/docs/installation) docs for instructions. If you run into issues, check the [Known Issues](https://github.com/HavocFramework/Havoc/wiki#known-issues) page as well as the open/closed [Issues](https://github.com/HavocFramework/Havoc/issues) list.
 
+#### Headless Go Client
+
+Havoc ships with a Go-based headless client for operators who prefer a terminal workflow over the Qt GUI. Build the teamserver binary and authenticate with the new `headless` subcommand:
+
+```bash
+cd teamserver
+go build -o havoc
+./havoc headless --host 127.0.0.1 --port 40056 --user operator
+```
+
+Provide the operator password with `--password <value>` or set `HAVOC_PASSWORD` in the environment before launching the command. Use `--no-prompt` when you only want to stream log messages without the interactive shell.
+
+Inside the prompt, type `help` to see every available command. Typical examples are:
+
+* `listeners` – show the listeners the teamserver currently exposes.
+* `agents` – list active implants and their status.
+* `chat <message>` – broadcast a message to all connected operators.
+* `task <agent-id> <command-id> CommandLine whoami` – send an operator task to an agent (command identifiers are defined in [`teamserver/pkg/agent/commands.go`](teamserver/pkg/agent/commands.go)).
+* `mark <agent-id> Dead` – flag an agent session without closing the connection.
+
+Consult [`docs/headless-go-client.md`](docs/headless-go-client.md) for a deeper dive into extending or automating the headless client.
+
 ---
 
 ### Features
