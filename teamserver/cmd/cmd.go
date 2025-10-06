@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"Havoc/cmd/headless"
 	"Havoc/cmd/server"
 	"Havoc/pkg/colors"
 
@@ -42,6 +43,7 @@ func init() {
 	HavocCli.Flags().SortFlags = false
 	HavocCli.AddCommand(CobraServer)
 	HavocCli.AddCommand(CobraClient)
+	HavocCli.AddCommand(headless.CobraHeadless)
 }
 
 func teamserverFunc(cmd *cobra.Command, args []string) error {
