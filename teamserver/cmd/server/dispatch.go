@@ -174,6 +174,7 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 									command = 0
 
 								} else {
+									command = int(parsed)
 									*Message = make(map[string]string)
 
 									var ClientID string
