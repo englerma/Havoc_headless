@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +39,7 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 							t.AgentUpdate(t.Agents.Agents[i])
 						}
 					}
+
 				}
 			}
 
@@ -165,7 +167,7 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 							} else {
 
 								// TODO: move to own function.
-								command, err = strconv.Atoi(val.(string))
+								command, err = parseCommandID(val)
 								if err != nil {
 
 									logger.Error("Failed to convert CommandID to integer: " + err.Error())
@@ -950,4 +952,91 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 			}
 		}
 	}
+}
+
+func parseCommandID(raw interface{}) (int, error) {
+	if raw == nil {
+		return 0, fmt.Errorf("empty CommandID value")
+	}
+
+	switch v := raw.(type) {
+	case int:
+		return v, nil
+	case int32:
+		return int(v), nil
+	case int64:
+		return int(v), nil
+	case uint:
+		return int(v), nil
+	case uint32:
+		return int(v), nil
+	case uint64:
+		return int(v), nil
+	case float32:
+		if math.Trunc(float64(v)) != float64(v) {
+			return 0, fmt.Errorf("non-integer CommandID value %v", v)
+		}
+		return int(v), nil
+	case float64:
+		if math.Trunc(v) != v {
+			return 0, fmt.Errorf("non-integer CommandID value %v", v)
+		}
+		return int(v), nil
+	case json.Number:
+		return parseCommandID(v.String())
+	case fmt.Stringer:
+		return parseCommandID(v.String())
+	case []byte:
+		return parseCommandID(string(v))
+	case string:
+		return parseCommandIDString(v)
+	default:
+		return parseCommandIDString(fmt.Sprint(v))
+	}
+}
+
+func parseCommandIDString(raw string) (int, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, fmt.Errorf("empty CommandID value")
+	}
+
+	// Fast path: decimal values used by the native UI and most automations.
+	if parsed, err := strconv.ParseInt(s, 10, 32); err == nil {
+		return int(parsed), nil
+	}
+
+	// Allow hexadecimal prefixes commonly used by the headless client.
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		parsed, err := strconv.ParseUint(s[2:], 16, 32)
+		if err != nil {
+			return 0, fmt.Errorf("invalid hexadecimal CommandID %q: %w", s, err)
+		}
+		return int(parsed), nil
+	}
+
+	// Accept octal prefixed values (e.g. 0o755) and other bases supported by strconv.ParseInt.
+	if strings.HasPrefix(s, "0o") || strings.HasPrefix(s, "0O") {
+		parsed, err := strconv.ParseUint(s[2:], 8, 32)
+		if err != nil {
+			return 0, fmt.Errorf("invalid octal CommandID %q: %w", s, err)
+		}
+		return int(parsed), nil
+	}
+
+	if strings.HasPrefix(s, "0b") || strings.HasPrefix(s, "0B") {
+		parsed, err := strconv.ParseUint(s[2:], 2, 32)
+		if err != nil {
+			return 0, fmt.Errorf("invalid binary CommandID %q: %w", s, err)
+		}
+		return int(parsed), nil
+	}
+
+	// Final attempt using strconv with base auto-detection for any remaining formats.
+	parsed, err := strconv.ParseInt(s, 0, 32)
+	if err != nil {
+		return 0, fmt.Errorf("unsupported CommandID value %q: %w", s, err)
+	}
+
+	return int(parsed), nil
 }
