@@ -166,7 +166,8 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 
 								// TODO: move to own function.
 								var parsed int64
-								parsed, err = strconv.ParseInt(val.(string), 0, 32)
+								commandString := strings.TrimSpace(fmt.Sprint(val))
+								parsed, err = strconv.ParseInt(commandString, 0, 32)
 								if err != nil {
 
 									logger.Error("Failed to convert CommandID to integer: " + err.Error())
