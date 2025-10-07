@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +39,7 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 							t.AgentUpdate(t.Agents.Agents[i])
 						}
 					}
+
 				}
 			}
 
@@ -165,7 +167,7 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 							} else {
 
 								// TODO: move to own function.
-								command, err = strconv.Atoi(val.(string))
+								command, err = parseCommandID(val)
 								if err != nil {
 
 									logger.Error("Failed to convert CommandID to integer: " + err.Error())
@@ -949,5 +951,62 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 
 			}
 		}
+	}
+}
+
+func parseCommandID(raw interface{}) (int, error) {
+	if raw == nil {
+		return 0, fmt.Errorf("empty CommandID value")
+	}
+
+	switch v := raw.(type) {
+	case int:
+		return v, nil
+	case int32:
+		return int(v), nil
+	case int64:
+		return int(v), nil
+	case uint:
+		return int(v), nil
+	case uint32:
+		return int(v), nil
+	case uint64:
+		return int(v), nil
+	case float32:
+		if math.Trunc(float64(v)) != float64(v) {
+			return 0, fmt.Errorf("non-integer CommandID value %v", v)
+		}
+		return int(v), nil
+	case float64:
+		if math.Trunc(v) != v {
+			return 0, fmt.Errorf("non-integer CommandID value %v", v)
+		}
+		return int(v), nil
+	case json.Number:
+		return parseCommandID(string(v))
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return 0, fmt.Errorf("empty CommandID value")
+		}
+
+		parsed, err := strconv.ParseInt(s, 0, 32)
+		if err != nil {
+			return 0, err
+		}
+
+		return int(parsed), nil
+	default:
+		s := strings.TrimSpace(fmt.Sprint(v))
+		if s == "" {
+			return 0, fmt.Errorf("unsupported CommandID type %T", raw)
+		}
+
+		parsed, err := strconv.ParseInt(s, 0, 32)
+		if err != nil {
+			return 0, err
+		}
+
+		return int(parsed), nil
 	}
 }
