@@ -165,13 +165,15 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 							} else {
 
 								// TODO: move to own function.
-								command, err = strconv.Atoi(val.(string))
+								var parsed int64
+								parsed, err = strconv.ParseInt(val.(string), 0, 32)
 								if err != nil {
 
 									logger.Error("Failed to convert CommandID to integer: " + err.Error())
 									command = 0
 
 								} else {
+									command = int(parsed)
 									*Message = make(map[string]string)
 
 									var ClientID string
