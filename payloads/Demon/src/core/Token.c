@@ -9,6 +9,20 @@
 
 #include <ntstatus.h>
 
+BOOL GetTokenInfo(
+    IN HANDLE hToken,
+    OUT PDWORD pTokenType,
+    OUT PDWORD pIntegrity,
+    OUT PDWORD pImpersonationLevel,
+    OUT PBUFFER UserDomain
+);
+
+BOOL IsNotCurrentUser(
+    BOOL DoCheck,
+    PBUFFER UserA,
+    PBUFFER UserB
+);
+
 /* TODO: Change the way new tokens gets added.
  *
  * Instead of appending it to the newest token like:
