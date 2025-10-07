@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +36,11 @@ import (
 )
 
 func NewTeamserver(DatabasePath string) *Teamserver {
+	if err := os.MkdirAll(filepath.Dir(DatabasePath), 0o755); err != nil {
+		logger.Error("Failed to create database directory: " + err.Error())
+		return nil
+	}
+
 	if d, err := db.DatabaseNew(DatabasePath); err != nil {
 		logger.Error("Failed to create a new db: " + err.Error())
 		return nil

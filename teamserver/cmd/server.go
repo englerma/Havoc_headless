@@ -35,6 +35,9 @@ var CobraServer = &cobra.Command{
 		}
 
 		Server = server.NewTeamserver(DatabasePath)
+		if Server == nil {
+			return fmt.Errorf("failed to initialize teamserver database")
+		}
 		Server.SetServerFlags(flags)
 
 		logr.LogrInstance = logr.NewLogr(DirPath, LogrPath)
