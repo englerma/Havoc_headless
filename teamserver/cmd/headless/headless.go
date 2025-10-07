@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -294,6 +295,8 @@ func (c *headlessClient) handlePackage(pk packager.Package) {
 		c.handleSession(pk)
 	case packager.Type.Teamserver.Type:
 		c.handleTeamserver(pk)
+	case packager.Type.Gate.Type:
+		c.handleGate(pk)
 	case packager.Type.Chat.Type:
 		c.handleChat(pk)
 	default:
@@ -421,6 +424,55 @@ func (c *headlessClient) handleTeamserver(pk packager.Package) {
 	if profile := stringValue(pk.Body.Info, "profile"); profile != "" {
 		c.printf("teamserver profile: %s", profile)
 	}
+}
+
+func (c *headlessClient) handleGate(pk packager.Package) {
+	info := pk.Body.Info
+
+	if message := stringValue(info, "Message"); message != "" {
+		msgType := stringValue(info, "MessageType")
+		if msgType == "" {
+			msgType = "message"
+		} else {
+			msgType = strings.ToLower(msgType)
+		}
+		c.printf("builder %s: %s", msgType, message)
+		return
+	}
+
+	payloadB64 := stringValue(info, "PayloadArray")
+	if payloadB64 == "" {
+		c.printf("received gate event %d/%d", pk.Head.Event, pk.Body.SubEvent)
+		return
+	}
+
+	data, err := base64.StdEncoding.DecodeString(payloadB64)
+	if err != nil {
+		c.printf("builder payload decode error: %v", err)
+		return
+	}
+
+	fileName := filepath.Base(stringValue(info, "FileName"))
+	if fileName == "" {
+		fileName = fmt.Sprintf("payload-%s.bin", time.Now().Format("20060102-150405"))
+	}
+
+	path := fileName
+	if statErr := ensureWritablePath(&path); statErr != nil {
+		c.printf("builder produced payload (%d bytes) but could not prepare %s: %v", len(data), fileName, statErr)
+		return
+	}
+
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		c.printf("builder produced payload (%d bytes) but failed to save %s: %v", len(data), path, err)
+		return
+	}
+
+	format := stringValue(info, "Format")
+	if format == "" {
+		format = "payload"
+	}
+	c.printf("builder saved %s to %s (%d bytes)", format, path, len(data))
 }
 
 func (c *headlessClient) handleChat(pk packager.Package) {
@@ -1040,6 +1092,43 @@ func mapToStringMap(in map[string]any) map[string]string {
 		}
 	}
 	return out
+}
+
+func ensureWritablePath(path *string) error {
+	candidate := *path
+	if candidate == "" {
+		return errors.New("output path cannot be empty")
+	}
+
+	info, err := os.Stat(candidate)
+	if err != nil {
+		if os.IsNotExist(err) {
+			parent := filepath.Dir(candidate)
+			if parent != "." {
+				if stat, statErr := os.Stat(parent); statErr != nil {
+					return statErr
+				} else if !stat.IsDir() {
+					return fmt.Errorf("%s is not a directory", parent)
+				}
+			}
+			return nil
+		}
+		return err
+	}
+
+	if info.IsDir() {
+		return fmt.Errorf("%s is a directory", candidate)
+	}
+
+	base := strings.TrimSuffix(candidate, filepath.Ext(candidate))
+	ext := filepath.Ext(candidate)
+	for i := 1; ; i++ {
+		next := fmt.Sprintf("%s-%d%s", base, i, ext)
+		if _, err := os.Stat(next); os.IsNotExist(err) {
+			*path = next
+			return nil
+		}
+	}
 }
 
 func readLine(reader *bufio.Reader) (string, error) {

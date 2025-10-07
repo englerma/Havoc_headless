@@ -147,9 +147,9 @@ if err := client.sendPackage(pk); err != nil {
 }
 ```
 
-The dispatcher emits console events that stream build progress, followed by a `Gate.Stageless` response whose `PayloadArray` field contains the base64 payload bytes. Persist the returned data under a meaningful filename (for example `demon.x64.bin` for stageless shellcode) and deploy it however you normally would.
+The dispatcher emits console events that stream build progress, followed by a `Gate.Stageless` response whose `PayloadArray` field contains the base64 payload bytes. The headless client now prints those console messages and automatically writes the decoded payload to disk using the server-provided filename (it appends a numeric suffix when the file already exists).【F:teamserver/cmd/headless/headless.go†L429-L476】 Check the prompt output for the exact save path—for example `demon.x64.bin` for stageless shellcode—and deploy it however you normally would.
 
-Because the headless client already logs gate events, you can keep it in interactive mode to watch the build output, or run with `--no-prompt` and process the responses programmatically inside your automation. 【F:teamserver/cmd/headless/headless.go†L70-L108】【F:teamserver/cmd/headless/headless.go†L252-L320】
+Because the headless client captures the gate stream, you can keep it in interactive mode to watch the build output, or run with `--no-prompt` and process the responses programmatically inside your automation.【F:teamserver/cmd/headless/headless.go†L70-L108】【F:teamserver/cmd/headless/headless.go†L429-L476】
 
 ## Putting it together
 
