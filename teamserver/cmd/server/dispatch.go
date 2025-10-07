@@ -984,30 +984,60 @@ func parseCommandID(raw interface{}) (int, error) {
 		}
 		return int(v), nil
 	case json.Number:
+		return parseCommandID(v.String())
+	case fmt.Stringer:
+		return parseCommandID(v.String())
+	case []byte:
 		return parseCommandID(string(v))
 	case string:
-		s := strings.TrimSpace(v)
-		if s == "" {
-			return 0, fmt.Errorf("empty CommandID value")
-		}
-
-		parsed, err := strconv.ParseInt(s, 0, 32)
-		if err != nil {
-			return 0, err
-		}
-
-		return int(parsed), nil
+		return parseCommandIDString(v)
 	default:
-		s := strings.TrimSpace(fmt.Sprint(v))
-		if s == "" {
-			return 0, fmt.Errorf("unsupported CommandID type %T", raw)
-		}
+		return parseCommandIDString(fmt.Sprint(v))
+	}
+}
 
-		parsed, err := strconv.ParseInt(s, 0, 32)
-		if err != nil {
-			return 0, err
-		}
+func parseCommandIDString(raw string) (int, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, fmt.Errorf("empty CommandID value")
+	}
 
+	// Fast path: decimal values used by the native UI and most automations.
+	if parsed, err := strconv.ParseInt(s, 10, 32); err == nil {
 		return int(parsed), nil
 	}
+
+	// Allow hexadecimal prefixes commonly used by the headless client.
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		parsed, err := strconv.ParseUint(s[2:], 16, 32)
+		if err != nil {
+			return 0, fmt.Errorf("invalid hexadecimal CommandID %q: %w", s, err)
+		}
+		return int(parsed), nil
+	}
+
+	// Accept octal prefixed values (e.g. 0o755) and other bases supported by strconv.ParseInt.
+	if strings.HasPrefix(s, "0o") || strings.HasPrefix(s, "0O") {
+		parsed, err := strconv.ParseUint(s[2:], 8, 32)
+		if err != nil {
+			return 0, fmt.Errorf("invalid octal CommandID %q: %w", s, err)
+		}
+		return int(parsed), nil
+	}
+
+	if strings.HasPrefix(s, "0b") || strings.HasPrefix(s, "0B") {
+		parsed, err := strconv.ParseUint(s[2:], 2, 32)
+		if err != nil {
+			return 0, fmt.Errorf("invalid binary CommandID %q: %w", s, err)
+		}
+		return int(parsed), nil
+	}
+
+	// Final attempt using strconv with base auto-detection for any remaining formats.
+	parsed, err := strconv.ParseInt(s, 0, 32)
+	if err != nil {
+		return 0, fmt.Errorf("unsupported CommandID value %q: %w", s, err)
+	}
+
+	return int(parsed), nil
 }
