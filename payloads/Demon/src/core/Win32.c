@@ -1500,7 +1500,7 @@ PROOT_DIR listDir(
     PSUB_DIR         SubDir        = NULL;
     BOOL             IsDir         = FALSE;
     LPWSTR           Path          = NULL;
-    UINT32           PathSize      = NULL;
+    UINT32           PathSize      = 0;
     BOOL             Success       = FALSE;
 
     if ( ( ! StartPath ) || ( FilesOnly && DirsOnly ) ) {
