@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math/rand"
 	"net/url"
 	"os"
@@ -960,7 +961,9 @@ func (c *headlessClient) handleTaskCommand(line string, args []string) error {
 	}
 
 	if parsedID, err := strconv.ParseInt(commandID, 0, 64); err == nil {
-		c.applyCommandDefaults(info, int(parsedID))
+		if err := c.applyCommandDefaults(info, int(parsedID)); err != nil {
+			return err
+		}
 	}
 
 	pk := packager.Package{
@@ -987,13 +990,18 @@ func (c *headlessClient) handleTaskCommand(line string, args []string) error {
 	return nil
 }
 
-func (c *headlessClient) applyCommandDefaults(info map[string]any, commandID int) {
+func (c *headlessClient) applyCommandDefaults(info map[string]any, commandID int) error {
 	switch commandID {
 	case agent.COMMAND_PROC_LIST:
 		if _, ok := info["FromProcessManager"]; !ok {
 			info["FromProcessManager"] = "false"
 		}
+	case agent.COMMAND_FS:
+		if err := applyFilesystemDefaults(info); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (c *headlessClient) markAgent(agentID, mark string) error {
@@ -1040,6 +1048,159 @@ func (s *clientState) snapshotListeners() []listenerSummary {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+func applyFilesystemDefaults(info map[string]any) error {
+	subcommand := strings.ToLower(cleanTokenValue(stringValue(info, "SubCommand")))
+	if subcommand != "upload" {
+		return nil
+	}
+
+	arguments := cleanTokenValue(stringValue(info, "Arguments"))
+	fileData := ""
+	remotePath := ""
+
+	if strings.Contains(arguments, ";") {
+		parts := strings.SplitN(arguments, ";", 2)
+		first := cleanTokenValue(parts[0])
+		second := cleanTokenValue(parts[1])
+
+		if decoded, err := base64.StdEncoding.DecodeString(second); err == nil && len(decoded) > 0 {
+			fileData = second
+			remotePath = first
+		} else {
+			if encoded, ok, err := readFileMaybe(first); err != nil {
+				return err
+			} else if ok {
+				fileData = encoded
+				remotePath = second
+			} else if encoded, ok, err := readFileMaybe(second); err != nil {
+				return err
+			} else if ok {
+				fileData = encoded
+				remotePath = first
+			} else {
+				remotePath = second
+			}
+		}
+	} else {
+		remotePath = arguments
+	}
+
+	if fileData == "" {
+		if val := cleanTokenValue(stringValue(info, "File")); val != "" {
+			encoded, err := ensureFileData(val)
+			if err != nil {
+				return err
+			}
+			fileData = encoded
+		}
+	}
+
+	if fileData == "" {
+		if remotePath == "" {
+			return errors.New("upload requires a remote path and file data")
+		}
+		return fmt.Errorf("upload requires a local file path; unable to read data for %q", remotePath)
+	}
+
+	remotePath = cleanTokenValue(remotePath)
+	if remotePath == "" {
+		return errors.New("upload requires a remote path")
+	}
+
+	remoteBase64 := remotePath
+	if _, err := base64.StdEncoding.DecodeString(remotePath); err != nil {
+		remoteBase64 = base64.StdEncoding.EncodeToString([]byte(remotePath))
+	}
+
+	info["Arguments"] = fmt.Sprintf("%s;%s", remoteBase64, fileData)
+	return nil
+}
+
+func ensureFileData(value string) (string, error) {
+	trimmed := cleanTokenValue(value)
+	if trimmed == "" {
+		return "", errors.New("file path cannot be empty")
+	}
+	if strings.HasPrefix(trimmed, "@") {
+		trimmed = strings.TrimPrefix(trimmed, "@")
+		trimmed = cleanTokenValue(trimmed)
+	}
+
+	if _, err := base64.StdEncoding.DecodeString(trimmed); err == nil {
+		return trimmed, nil
+	}
+
+	encoded, ok, err := readFileMaybe(trimmed)
+	if err != nil {
+		return "", err
+	}
+	if ok {
+		return encoded, nil
+	}
+
+	return "", fmt.Errorf("could not read file %q", trimmed)
+}
+
+func readFileMaybe(path string) (string, bool, error) {
+	cleaned := cleanTokenValue(path)
+	if cleaned == "" {
+		return "", false, nil
+	}
+	if strings.HasPrefix(cleaned, "@") {
+		cleaned = strings.TrimPrefix(cleaned, "@")
+	}
+
+	expanded, err := expandPath(cleaned)
+	if err != nil {
+		return "", false, err
+	}
+
+	data, err := os.ReadFile(expanded)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+
+	return base64.StdEncoding.EncodeToString(data), true, nil
+}
+
+func expandPath(path string) (string, error) {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return "", errors.New("path cannot be empty")
+	}
+	if strings.HasPrefix(trimmed, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if trimmed == "~" {
+			trimmed = home
+		} else if strings.HasPrefix(trimmed, "~/") || strings.HasPrefix(trimmed, "~"+string(os.PathSeparator)) {
+			trimmed = filepath.Join(home, trimmed[2:])
+		}
+	}
+	return filepath.Clean(trimmed), nil
+}
+
+func cleanTokenValue(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if len(trimmed) >= 2 {
+		const singleQuote byte = 39
+		start := trimmed[0]
+		end := trimmed[len(trimmed)-1]
+		if (start == '"' && end == '"') || (start == singleQuote && end == singleQuote) {
+			if unquoted, err := strconv.Unquote(trimmed); err == nil {
+				return unquoted
+			}
+			trimmed = trimmed[1 : len(trimmed)-1]
+		}
+	}
+	return trimmed
 }
 
 func (s *clientState) snapshotAgents() []*agentSummary {
