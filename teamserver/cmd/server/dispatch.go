@@ -17,6 +17,24 @@ import (
 	"Havoc/pkg/packager"
 )
 
+func parseCommandID(value interface{}) (int, error) {
+	if value == nil {
+		return 0, errors.New("CommandID is nil")
+	}
+
+	trimmed := strings.TrimSpace(fmt.Sprint(value))
+	if trimmed == "" {
+		return 0, errors.New("CommandID is empty")
+	}
+
+	parsed, err := strconv.ParseInt(trimmed, 0, 32)
+	if err != nil {
+		return 0, err
+	}
+
+	return int(parsed), nil
+}
+
 func (t *Teamserver) DispatchEvent(pk packager.Package) {
 	switch pk.Head.Event {
 
@@ -165,10 +183,10 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 							} else {
 
 								// TODO: move to own function.
-								command, err = strconv.Atoi(val.(string))
+								command, err = parseCommandID(val)
 								if err != nil {
 
-									logger.Error("Failed to convert CommandID to integer: " + err.Error())
+									logger.Error(fmt.Sprintf("Failed to parse CommandID %v: %v", val, err))
 									command = 0
 
 								} else {
